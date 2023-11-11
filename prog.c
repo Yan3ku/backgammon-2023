@@ -11,6 +11,8 @@
  * This is important for "plctoscr" function (place to screen)
  */
 
+#define TITLE     "The Game of GAMMON by yan3ku v0.1"
+
 #define PLC_SYM(i) (i % 2 ? i < 12 ? "/\\" : "\\/" : "..")
 #define nelem(x) (sizeof(x) / sizeof(*x))
 
@@ -21,11 +23,11 @@ enum {
 	CHECK_COUNT = 15,
 	/* offsets */
 	PLC_OFF = 2,  /* place width    */
-	GAPH_OFF = 1, /* horizontal gap */
+	GAPH_OFF = 2, /* horizontal gap */
 	GAPV_OFF = 3, /* vertical gap   */
-	BAR_OFF = 4,
+	BAR_OFF = 3,
 
-	WBOARD_ROWS = 5 * 2 + GAPV_OFF,
+	WBOARD_ROWS = 6 * 2 + GAPV_OFF,
 	WBOARD_COLS = PLC_OFF * 12 + GAPH_OFF * 14 + BAR_OFF,
 };
 
@@ -64,17 +66,22 @@ boarddrw(Board *board)
 	int i, j;
 	int x, y;
 
-	board->wroot    = newwin(WBOARD_ROWS + 2 + 10, WBOARD_COLS + 2 + 10, 0, 0);
-	board->wboarder = derwin(board->wroot, WBOARD_ROWS + 2, WBOARD_COLS + 2, 0, 0);
+	board->wroot    = newwin(
+			WBOARD_ROWS + 2 + 6,       WBOARD_COLS + 2 + 6,
+			(LINES - WBOARD_ROWS - 8) / 2,  (COLS - WBOARD_COLS - 8) / 2
+			);
+	board->wboarder = derwin(board->wroot, WBOARD_ROWS + 2, WBOARD_COLS + 2, 3, 0);
 	board->wboard   = derwin(board->wboarder, WBOARD_ROWS, WBOARD_COLS, 1, 1);
 	wborder(board->wboarder, ':', ':', '=', '=', '=', '=', '=', '=');
+	mvwprintw(board->wroot, 0, 0, TITLE);
 
 	for (i = 0; i < BOARD_PLC; i++)  {
-		for (j = 0; j < 5; j++) {
+		for (j = 0; j < 6; j++) {
 			plctoscr(i, j, &x, &y);
 			wattron(board->wboard, A_BOLD);
 			mvwprintw(board->wboard, x, y, PLC_SYM(i));
 		}
+		mvwprintw(board->wroot, i > 11 ? 2 : WBOARD_ROWS + 5, y + 1, "%02d", i + 1);
 	}
 }
 
