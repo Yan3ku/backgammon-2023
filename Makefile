@@ -1,5 +1,5 @@
 CPPFLAGS = $(shell ncursesw6-config --cflags)
-CFLAGS   = -ggdb -std=c99 -pedantic -Wextra -Wall ${CPPFLAGS} 
+CFLAGS   = -ggdb -std=c89 -Wextra -Wall ${CPPFLAGS} 
 LDFLAGS  = $(shell ncursesw6-config --libs)
 
 BIN = prog
