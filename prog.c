@@ -1,5 +1,38 @@
+#if 0
+set -xe
+
+SRC="prog.c"
+BIN="prog"
+
+CPPFLAGS="$(ncursesw6-config --cflags)"
+CFLAGS="-ggdb -std=c99 -pedantic -Wextra -Wall $CPPFLAGS"
+LDFLAGS="$(ncursesw6-config --libs)"
+CC="cc"
+
+if [ "$1" = run ]; then
+	exec ./$BIN
+fi
+
+if [ "$1" = clean ]; then
+	for f in $SRC; do
+		rm -f "${f%.c}.o"
+	done
+	rm -f "$BIN"
+	[ $# -eq 1 ] && exit 0
+fi
+
+for f in $SRC; do
+	out=${f%.c}.o
+	OBJ="$OBJ $out"
+	if [ ! -e "$out" ] || [ "$(find -L "$f" -prune -newer "$out")" ]; then
+		$CC -c $CFLAGS $f -o "$out"
+	fi
+done
+
+[ "$OBJ" ] && $CC $OBJ $LDFLAGS -o "$BIN"
+exit 0
+#endif
 /* ANSI C GAMMON */
-/* note: x: columns, y: rows for ncurses */
 #include <curses.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -9,14 +42,16 @@
 #include <ncurses.h>
 
 #define TITLE            "The Game of GAMMON by yan3ku v0.1"
-#define ROLL_PR(p)       "%s roll> ", ROLL_STR[p - 1]
-#define PLC_SYM_(i)      (i % 2 ? i < 12 ? "/\\" : "\\/" : "..")
-#define PLC_SYM(c, i, j) (c[i][j] == ME ? "░░" : c[i][j] == YOU ? "▓▓" : PLC_SYM_(i))
-#define SWAP_PL(p)       (p == ME ? YOU : p == YOU ? ME : EMPTY)
+#define ROLL_PROMPT(p)   "%s roll> ", ROLL_STR[(p) - 1]
+#define OTHER_PLAYER(p)   ((p) == ME ? YOU : (p) == YOU ? ME : EMPTY)
 #define nelem(x)         (sizeof(x) / sizeof(*x))
+#define TERM_SIZE_ERR    "Terminal window too small!"
+#define PLAYER_SYM(pl)   ((pl) == ME ? "░░" : "▓▓")
+#define PLAYER_DIR(pl)   ((pl) == ME ? "low to high" : "high to low")
+#define CMD_SIZ          5
 
 
-typedef enum { /* players */
+typedef enum {
 	EMPTY,
 	ME,
 	YOU,
@@ -27,6 +62,22 @@ typedef enum {
 	RUN,
 	END,
 } State;
+
+typedef enum {
+	VALUE_ERR = 2,
+	DIR_ERR,
+	PLAYER_ERR,
+	BEAT_ERR,
+	NO_MOVE_ERR,
+} MoveError;
+
+const char *ERR_STR[] = {
+	[VALUE_ERR]   = "No such place exist!",
+	[DIR_ERR]     = "Wrong movement direction!",
+	[PLAYER_ERR]  = "No checkers to move there!",
+	[BEAT_ERR]    = "You can't beat the opposing player!",
+	[NO_MOVE_ERR] = "No such move was rolled!",
+};
 
 const char *ROLL_STR[] = {"My", "Your"};
 
@@ -47,21 +98,30 @@ enum { /* spaces */
 
 enum { /* windows */
 	BOARDER      = 2,
+	PROMPT_LINES = 2,
+	HOME_COLS    = 6,
 	BOARD_LINES  = PILE_LINES * 2 + PILE_GAP_LINES + BOARDER,
 	BOARD_COLS   = PILE_COLS * 12 + PILE_GAP_COLS * 14 + BAR_COLS + BOARDER,
-	PROMPT_LINES = 2,
 	ROOT_LINES   = BOARD_LINES + PROMPT_LINES + 5,
-	HOME_COLS    = 6,
 	ROOT_COLS    = BOARD_COLS  + HOME_COLS,
 };
 
+typedef struct {
+	char val;
+	char use;
+} Cube;
 
 typedef struct {
-	Player points[24][15];
+	Player pl;
+	int count;
+} Place;
+
+typedef struct {
+	Place places[24];
 	Player bar[30];
 	Player turn;
 	State state;
-	int cube[2];
+	Cube cube[2];
 	WINDOW *root;
 	WINDOW *board;
 	WINDOW *roll[2];
@@ -70,11 +130,11 @@ typedef struct {
 	WINDOW *home;
 } Game;
 
-const int GAME_TEMPLATE[12][15] = { /* beginning game state */
-	[0]  = {ME, ME},
-	[5]  = {YOU, YOU, YOU, YOU, YOU},
-	[7]  = {YOU, YOU, YOU},
-	[11] = {ME, ME, ME, ME, ME},
+const Place GAME_TEMPLATE[12] = { /* beginning game state */
+	[0]  = {.pl = ME,  .count = 2},
+	[5]  = {.pl = YOU, .count = 5},
+	[7]  = {.pl = YOU, .count = 3},
+	[11] = {.pl = ME,  .count = 5},
 };
 
 
@@ -87,9 +147,24 @@ setup()
 	cbreak();
 	noecho();
 	start_color();
-	curs_set(0);
 	keypad(stdscr, TRUE);
 	use_default_colors();
+}
+
+Game *
+gamecreate()
+{
+	Game *game;
+	size_t i;
+	
+	game = calloc(1, sizeof *game);
+	memcpy(game->places, GAME_TEMPLATE, sizeof(GAME_TEMPLATE));
+	for (i = 0; i < 12; i++) {
+		game->places[23 - i].pl = OTHER_PLAYER(game->places[i].pl);
+		game->places[23 - i].count = game->places[i].count;
+	}
+	game->state = START;
+	return game;
 }
 
 /*
@@ -99,20 +174,61 @@ setup()
  * VERTICAL:
  * 5*<plc> <counter> <gap> <counter> 5*<plc>
  * +2 for outside border
+ * The below calculations are based on that.
  */
 void
-plctoscr(int plc, int i, int *y, int *x) {
-	int col = abs(11 - plc) - (plc > 11);
+plctoscr(int i, int j, int *y, int *x)
+{
+	int col = abs(11 - i) - (i > 11);
 	int bar = col < 6 ? 0 : BAR_COLS + PILE_GAP_COLS;
 	*x = PILE_GAP_COLS + col * (PILE_GAP_COLS + PILE_COLS) + bar + 1;
-	*y = (plc < 12 ? BOARD_LINES - i - 2 : i + 1);
+	*y = (i < 12 ? BOARD_LINES - j - 2 : j + 1);
+}
+
+const char *
+plctosym(const Place *plc, int i, int j)
+{
+	static char str[3];
+	if (j == 5 && plc[i].count > 5) {
+		sprintf(str, "%02hu", plc[i].count - 5);
+		return str;
+	}
+	if (plc[i].count > j && plc[i].pl)
+		return PLAYER_SYM(plc[i].pl);
+	return i % 2 ? (i < 12 ? "/\\" : "\\/") : "..";
 }
 
 void
-gamedrw(Game *game)
+boarddrw(Game *game)
+{
+	size_t i, j;
+	int x, y;
+
+	for (i = 0; i < 3; i++) /* bar */
+		mvwvline(game->board, 1, BOARD_COLS / 2 - i + 1, '|', BOARD_LINES - 2);
+	mvwprintw(game->board, BOARD_LINES / 2, BOARD_COLS / 2 - 2, "[BAR]");
+
+	for (i = 0; i < nelem(game->places); i++)  { /* places */
+		for (j = 0; j < 6; j++) {
+			plctoscr(i, j, &y, &x);
+			mvwaddstr(game->board, y, x, plctosym(game->places, i, j));
+		}
+	}
+	wnoutrefresh(game->board);
+}
+
+void
+gameinitdrw(Game *game)
 {
 	size_t i, j, boardendy;
 	int x, y;
+
+	if (COLS < ROOT_COLS || LINES < ROOT_LINES) {
+		mvprintw(LINES / 2, (COLS  - strlen(TERM_SIZE_ERR)) / 2, TERM_SIZE_ERR);
+		curs_set(0);
+		refresh();
+		return;
+	}
 
 	game->root  = newwin(ROOT_LINES, ROOT_COLS,
 	                     (LINES - ROOT_LINES) / 2,
@@ -120,25 +236,20 @@ gamedrw(Game *game)
 	game->board = derwin(game->root, BOARD_LINES, BOARD_COLS, 3, 0);
 	boardendy   = getpary(game->board) + getmaxy(game->board);
 
-	plctoscr(13, 0, &y, &x); /* 13 pile pos */
+	plctoscr(13, 0, &y, &x); /* 13 place pos */
 	game->roll[0] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
 	plctoscr(19, 0, &y, &x);
 	game->roll[1] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
 	game->prompt  = derwin(game->root, PROMPT_LINES, BOARD_COLS, boardendy + 2, 0);
 	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
-	mvwprintw(game->root, 0, 0, TITLE);
-	mvwprintw(game->prompt, 0, 0, TITLE);
+	mvwaddstr(game->root, 0, 0, TITLE);
+	mvwaddstr(game->prompt, 0, 0, TITLE);
 
 
-	for (i = 0; i < 3; i++) /* bar */
-		mvwvline(game->board, 1, BOARD_COLS / 2 - i + 1, '|', BOARD_LINES - 2);
-	mvwprintw(game->board, BOARD_LINES / 2, BOARD_COLS / 2 - 2, "[BAR]");
-
-	for (i = 0; i < nelem(game->points); i++)  { /* points */
-		for (j = 0; j < 6; j++) {
-			plctoscr(i, j, &y, &x);
-			mvwprintw(game->board, y, x, PLC_SYM(game->points, i, j));
-		}
+	boarddrw(game);
+	
+	for (i = 0, j = 0; i < nelem(game->places); i++) {
+		plctoscr(i, j, &y, &x);
 		mvwprintw(game->root, i < 12 ? boardendy : getpary(game->board) - 1, x, "%2ld", i + 1);
 	}
 	mvwprintw(game->root, BOARD_LINES / 2 + getpary(game->board), BOARD_COLS, "[HOME]");
@@ -147,87 +258,159 @@ gamedrw(Game *game)
 	wnoutrefresh(game->root);
 	wnoutrefresh(game->prompt);
 	wnoutrefresh(game->board);
+	doupdate();
 }
 
 void
-roll(int cube[2])
+roll(Cube cube[2])
 {
 	int i;
-	for (i = 0; i < 2; i++) cube[i] = rand() % 6;
+	for (i = 0; i < 2; i++) cube[i].val = rand() % 6 + 1;
+	cube[0].use = cube[1].use = (cube[0].val == cube[1].val ? 2 : 1);
 }
 
 #define rolldrw(game, player, str, ...) do {                                   \
-	mvwprintw(game->roll[player - 1], 0, 0, ROLL_PR(player));                 \
-	wprintw(  game->roll[player - 1], str, __VA_ARGS__);                      \
-	wnoutrefresh( game->roll[player - 1]);                                    \
+	mvwprintw(game->roll[player - 1], 0, 0, ROLL_PROMPT(player));              \
+	wprintw(  game->roll[player - 1], str, __VA_ARGS__);                       \
+	wnoutrefresh( game->roll[player - 1]);                                     \
 } while (0)
 
-void
-readprompt(Game *game)
+int /* newline consuming alternative to wget */
+wread(WINDOW *win, char *input, int maxlen)
 {
-	mvwprintw(game->prompt, 0, 0, "You ▓▓ have [%d] [%d] left, moving from high to low.", game->cube[0], game->cube[1]);
+	int ch;
+	*input = '\0';
+	char *beg = input;
+	doupdate();
+	keypad(win, TRUE);
+	while ((ch = wgetch(win)) != '\n') {
+		switch (ch) {
+		case KEY_BACKSPACE:
+			if (input - beg <= 0) continue;
+			wmove(win, getcury(win), getcurx(win) - 1);
+			wdelch(win);
+			input--;
+			break;
+		default:
+			if (input - beg >= maxlen) continue;
+			waddch(win, ch);
+			*(input++) = ch;
+			break;
+		}
+	}
+	*input = '\0';
+	return input - beg;
+}
+
+void
+readprompt(Game *game, char *start, char *end)
+{
+	int i, j;
+	*start = '\0';
+	*end = '\0';
+	mvwprintw(game->prompt, 0, 0, "You %s have ", PLAYER_SYM(game->turn));
+	for (i = 0; i < 2; i++)
+		for (j = 0; j < game->cube[i].use; j++)
+			wprintw(game->prompt, "[%d] ", game->cube[i].val);
+	wprintw(game->prompt, "left, moving from %s", PLAYER_DIR(game->turn));
 	mvwprintw(game->prompt, 1, 0, "Move from? ");
+	wnoutrefresh(game->prompt);
+	wread(game->prompt, start, CMD_SIZ);
+	wprintw(game->prompt, " To? ");
+	wread(game->prompt, end, CMD_SIZ);
+	wclear(game->prompt);
 	wnoutrefresh(game->prompt);
 }
 
-void
-updatescr(Game *game)
+size_t
+isvalidmv(const Game *game, int from, int to)
 {
+	size_t i;
+	int mv;
+	if (from < 0 || from > 23 || to < 0 || to > 23) return VALUE_ERR;
+	if ((game->turn == ME  && from > to) ||
+        (game->turn == YOU && from < to))           return DIR_ERR;
+	if (game->places[from].pl != game->turn)        return PLAYER_ERR;
+	if (game->places[to].pl == OTHER_PLAYER(game->turn) &&
+	    game->places[to].count > 1) return BEAT_ERR;
+	for (mv = abs(from - to), i = 0; i < nelem(game->cube); i++)
+		if (game->cube[i].use && game->cube[i].val == mv) return i;
+	return NO_MOVE_ERR;
 }
 
-void
-gamesetup(Game *game)
+int
+movecheker(Game *game, char *start, char *end)
 {
-	size_t i, j;
+	char *endptr;
+	size_t from, to, idx;
+	int sign;
 
-	memcpy(game->points, GAME_TEMPLATE, sizeof(GAME_TEMPLATE));
-	for (i = 0; i < 12; i++) {
-		for (j = 0; j < 5; j++)
-			game->points[23 - i][j] = SWAP_PL(game->points[i][j]);
-	}
-	game->state = START;
+	from = strtol(start, &endptr, 10) - 1;
+	if (start == endptr) return 0;
+	sign = (*end == '-' ? -1 : (*end == '+' ? 1 : 0));
+	if (sign) end++;
+	to = strtol(end, &endptr, 10) - 1;
+	if (sign) to = from + sign * (to + 1);
+	if (end == endptr) return 0;
+	mvwprintw(game->root, 0, 0, "[%s] [%s] [%ld] [%ld]", start, end, from, to);
+	wrefresh(game->root);
+	if ((idx = isvalidmv(game, from, to)) >= nelem(game->cube)) return idx;
+	game->places[to].pl = game->turn;
+	game->places[from].count--;
+	game->places[to].count++;
+	return idx;
 }
 
 int
 main()
 {
 	Game *game;
+	char start[CMD_SIZ], end[CMD_SIZ];
+	size_t i;
 
-	game = calloc(1, sizeof *game);
 	setup();
-
+	game = gamecreate();
 	for (;;) {
 		switch (game->state) {
-		case START: /* FALLTHROUGH */
-			gamesetup(game);
-			gamedrw(game);
-			doupdate();
+		case START:
+			gameinitdrw(game);
 			roll(game->cube);
-			rolldrw(game, ME,  "[%d]", game->cube[0]);
-			rolldrw(game, YOU, "[%d]", game->cube[1]);
-			game->turn = game->cube[0] > game->cube[1] ? ME : YOU;
-			doupdate();
-			getch();
-			wclear(game->roll[0]);
-			wclear(game->roll[1]);
-			wnoutrefresh(game->roll[0]);
-			wnoutrefresh(game->roll[1]);
-			doupdate();
+			rolldrw(game, ME,  "[%d]", game->cube[0].val);
+			rolldrw(game, YOU, "[%d]", game->cube[1].val);
+			game->turn = game->cube[0].val > game->cube[1].val ? ME : YOU;
 			game->state = RUN;
+			goto READ;
 		case RUN:
 			roll(game->cube);
-			rolldrw(game, game->turn, "[%d] [%d]", game->cube[0], game->cube[1]);
-			doupdate();
-			/*readprompt(game);*/
-			updatescr(game);
-			getch();
+			rolldrw(game, game->turn, "[%d] [%d]", game->cube[0].val, game->cube[1].val);
+READ:
+			for (;;) {
+				readprompt(game, start, end);
+				if ((i = movecheker(game, start, end)) < nelem(game->cube)) {
+					boarddrw(game);
+					game->cube[i].use--;
+					if (!game->cube[0].use && !game->cube[1].use)
+						goto NEXT_TURN;
+					continue;
+				}
+				curs_set(0); /* INVALID MOVE */
+				wclear(game->prompt);
+				mvwaddstr(game->prompt, 0, 0, ERR_STR[i]);
+				wrefresh(game->prompt);
+				napms(1500);
+				curs_set(1);
+				wclear(game->prompt);
+			}
+NEXT_TURN:
+			wclear(game->roll[game->turn - 1]);
+			wnoutrefresh(game->roll[game->turn - 1]);
+			game->turn = OTHER_PLAYER(game->turn);
 			break;
 		case END:
 			goto end;
 		}
 	}
 end:
-
 	endwin();
 	free(game);
 	return 0;
