@@ -1,46 +1,10 @@
-#if 0
-set -xe
-
-SRC="prog.c"
-BIN="prog"
-
-CPPFLAGS="$(ncursesw6-config --cflags)"
-CFLAGS="-ggdb -std=c99 -pedantic -Wextra -Wall $CPPFLAGS"
-LDFLAGS="$(ncursesw6-config --libs)"
-CC="cc"
-
-if [ "$1" = run ]; then
-	exec ./$BIN
-fi
-
-if [ "$1" = clean ]; then
-	for f in $SRC; do
-		rm -f "${f%.c}.o"
-	done
-	rm -f "$BIN"
-	[ $# -eq 1 ] && exit 0
-fi
-
-for f in $SRC; do
-	out=${f%.c}.o
-	OBJ="$OBJ $out"
-	if [ ! -e "$out" ] || [ "$(find -L "$f" -prune -newer "$out")" ]; then
-		$CC -c $CFLAGS $f -o "$out"
-	fi
-done
-
-[ "$OBJ" ] && $CC $OBJ $LDFLAGS -o "$BIN"
-exit 0
-#endif
 /* ANSI C GAMMON */
 #include <curses.h>
 #include <stdlib.h>
-#include <stdarg.h>
 #include <string.h>
 #include <time.h>
 #include <locale.h> /* extend ASCII ncurses */
 #include <ncursesw/curses.h>
-
 
 #define TITLE            "The Game of GAMMON by yan3ku v0.1"
 #define ROLL_PROMPT(p)   "%s roll> ", ROLL_STR[(p)]
@@ -50,6 +14,7 @@ exit 0
 #define PLAYER_SYM(pl)   ((pl) == ME ? "░░" : "▓▓")
 #define PLAYER_DIR(pl)   ((pl) == ME ? "low to high" : "high to low")
 #define UNUSED(p)        (void)(p)
+#define INPUT_LEN        5
 #define CMD_SIZ          5
 #define ERR_DISP_TIME    2000
 
@@ -66,12 +31,17 @@ typedef enum {
 } State;
 
 typedef enum {
-	VALUE_ERR = 2, /* first 0 and 1 are indexes to cube array */
+	INDEX_UNBOUND_ERR = 2, /* first 0 and 1 are indexes to cube array */
+	CMD_NAME_ERR,
+	INVALID_INPUT_ERR,
 	INPUT_ERR,
-	DIR_ERR,
-	PLAYER_ERR,
-	BEAT_ERR,
-	NO_MOVE_ERR,
+	MOVE_DIR_ERR,
+	IS_NOT_PLAYER_ERR,
+	CANT_BEAT_ERR,
+	NON_EMPTY_BAR_ERR,
+	NO_CHECKERS_BAR_ERR,
+	IS_NOT_HOME_ERR,
+	NO_MOVE_ROLLED_ERR,
 } MoveError;
 
 
@@ -91,13 +61,12 @@ enum { /* spaces */
 enum { /* windows */
 	BOARDER      = 2,
 	PROMPT_LINES = 2,
-	HOME_COLS    = 6,
+	HOME_COLS    = 7,
 	BOARD_LINES  = PILE_LINES * 2 + PILE_GAP_LINES + BOARDER,
 	BOARD_COLS   = PILE_COLS * 12 + PILE_GAP_COLS * 14 + BAR_COLS + BOARDER,
 	ROOT_LINES   = BOARD_LINES + PROMPT_LINES + 5,
 	ROOT_COLS    = BOARD_COLS  + HOME_COLS,
 };
-
 
 typedef struct {
 	char val;
@@ -112,6 +81,7 @@ typedef struct {
 typedef struct {
 	Place places[24];
 	int bar[2];
+	int home[2];
 	Player turn;
 	State state;
 	Cube cube[2];
@@ -120,16 +90,22 @@ typedef struct {
 	WINDOW *roll[2];
 	WINDOW *prompt;
 	WINDOW *score;
-	WINDOW *home;
+	WINDOW *whome;
 } Game;
 
+#define IS_HOME(pl, plc) (pl == ME ? plc >= 18 : plc <= 5)
+#define START_PLC(pl)    (pl == ME ? -1 : 24)
 
 const char *ERR_STR[] = {
-	[VALUE_ERR]   = "No such place exist!",
-	[DIR_ERR]     = "Wrong movement direction!",
-	[PLAYER_ERR]  = "No checkers to move there!",
-	[BEAT_ERR]    = "You can't beat the opposing player!",
-	[NO_MOVE_ERR] = "No such move was rolled!",
+	[INDEX_UNBOUND_ERR]   = "No such place exist!",
+	[INVALID_INPUT_ERR]   = "Wrong input! Usefull words: BAR, HOME, OUT",
+	[MOVE_DIR_ERR]        = "Wrong movement direction!",
+	[IS_NOT_PLAYER_ERR]   = "No checkers to move there!",
+	[CANT_BEAT_ERR]       = "You can't beat the opposing player!",
+	[NO_MOVE_ROLLED_ERR]  = "No such move was rolled!",
+	[NON_EMPTY_BAR_ERR]   = "You have checkers on bar!",
+	[NO_CHECKERS_BAR_ERR] = "No checkers on bar!",
+	[IS_NOT_HOME_ERR]     = "Destination must be home!",
 };
 
 const char *ROLL_STR[] = {"My", "Your"};
@@ -152,22 +128,36 @@ gamecreate()
 {
 	Game *game;
 	size_t i;
-	
+
 	game = calloc(1, sizeof *game);
 	for (i = 0; i < 12; i++) {
 		game->places[i].pl = EMPTY;
 	}
 
-	game->places[0]  = (Place){.pl = ME,  .count = 2};
-	game->places[5]  = (Place){.pl = YOU, .count = 5};
-	game->places[7]  = (Place){.pl = YOU, .count = 3};
-	game->places[11] = (Place){.pl = ME,  .count = 5};
+	/*
+	   game->places[0]  = (Place){.pl = ME,  .count = 2};
+	   game->places[5]  = (Place){.pl = YOU, .count = 5};
+	   game->places[7]  = (Place){.pl = YOU, .count = 3};
+	   game->places[11] = (Place){.pl = ME,  .count = 5};
+	*/
+
+	game->places[0]  = (Place){.pl = ME,  .count = 1};
+	game->places[1]  = (Place){.pl = YOU, .count = 1};
+	game->places[2]  = (Place){.pl = ME, .count = 1};
+	game->places[3]  = (Place){.pl = YOU, .count = 1};
+	game->places[4]  = (Place){.pl = YOU, .count = 1};
+	game->places[7]  = (Place){.pl = YOU, .count = 1};
+	game->places[11] = (Place){.pl = ME,  .count = 1};
+	game->bar[ME] = 3;
+	game->bar[YOU] = 3;
+	game->home[YOU] = 12;
+	game->home[ME] = 7;
 
 	for (i = 0; i < 12; i++) {
 		game->places[23 - i].pl = OTHER_PLAYER(game->places[i].pl);
 		game->places[23 - i].count = game->places[i].count;
 	}
-	game->bar[ME] = 3;
+
 	game->state = START;
 	return game;
 }
@@ -195,7 +185,7 @@ plctosym(const Place *plc, int i, int j)
 {
 	static char str[3];
 	if (j == 5 && plc[i].count > 5) {
-		sprintf(str, "%02hu", plc[i].count - 5);
+		sprintf(str, "%02hu", (short)(plc[i].count - 5));
 		return str;
 	}
 	if (plc[i].count > j && plc[i].pl != EMPTY)
@@ -209,17 +199,25 @@ boarddrw(Game *game)
 	size_t i, j;
 	int x, y;
 
-	for (i = 0; i < 3; i++) /* bar */
+	for (i = 0; i < 3; i++) /* bar lines */
 		mvwvline(game->board, 1, BOARD_COLS / 2 - i + 1, '|', BOARD_LINES - 2);
 	mvwprintw(game->board, BOARD_LINES / 2, BOARD_COLS / 2 - 2, "[BAR]");
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < 2; i++) { /* bar checkers */
 		for (j = 0; j < (size_t)game->bar[i] && j < 5; j++) {
-			y = i == YOU ? BOARD_LINES - 2 - j : j + 1;
+			y = (i == YOU ? BOARD_LINES - 2 - j : j + 1);
 			mvwaddstr(game->board, y, BOARD_COLS / 2 - (i == YOU ? 1 : 0),
 			          PLAYER_SYM(i));
 		}
 	}
+
+	for (i = 0; i < 2; i++) { /* home */
+		for (j = 0; j < (size_t)game->home[i]; j++) {
+			y = (i == YOU ? BOARD_LINES - 2 - j % 5 : j % 5 + 1);
+			mvwaddstr(game->whome, y, j / 5 * 2, PLAYER_SYM(i));
+		}
+	}
+	mvwprintw(game->whome, BOARD_LINES / 2, 0, "[HOME]");
 
 	for (i = 0; i < nelem(game->places); i++)  { /* places */
 		for (j = 0; j < 6; j++) {
@@ -227,6 +225,8 @@ boarddrw(Game *game)
 			mvwaddstr(game->board, y, x, plctosym(game->places, i, j));
 		}
 	}
+
+	wnoutrefresh(game->whome);
 	wnoutrefresh(game->board);
 }
 
@@ -257,17 +257,21 @@ gameinitdrw(Game *game)
 	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
 	mvwaddstr(game->root, 0, 0, TITLE);
 	mvwaddstr(game->prompt, 0, 0, TITLE);
+	game->whome = derwin(game->root, BOARD_LINES, HOME_COLS, getpary(game->board), BOARD_COLS);
+	mvwhline(game->whome, 0, 0, '=', HOME_COLS);
+	mvwhline(game->whome, BOARD_LINES - 1, 0, '=', HOME_COLS);
+	mvwvline(game->whome, 0, HOME_COLS - 1, ':', BOARD_LINES);
 
 	boarddrw(game);
-	
+
 	for (i = 0, j = 0; i < nelem(game->places); i++) {
 		plctoscr(i, j, &y, &x);
 		mvwprintw(game->root, i < 12 ? boardendy : getpary(game->board) - 1, x, "%2ld", i + 1);
 	}
-	mvwprintw(game->root, BOARD_LINES / 2 + getpary(game->board), BOARD_COLS, "[HOME]");
 
 	wnoutrefresh(stdscr);
 	wnoutrefresh(game->root);
+	wnoutrefresh(game->whome);
 	wnoutrefresh(game->prompt);
 	wnoutrefresh(game->board);
 	doupdate();
@@ -314,7 +318,7 @@ wread(WINDOW *win, char *input, int maxlen)
 	return input - beg;
 }
 
-void
+int
 readprompt(Game *game, char *start, char *end)
 {
 	int i, j;
@@ -325,52 +329,115 @@ readprompt(Game *game, char *start, char *end)
 		for (j = 0; j < game->cube[i].use; j++)
 			wprintw(game->prompt, "[%d] ", game->cube[i].val);
 	wprintw(game->prompt, "left, moving from %s", PLAYER_DIR(game->turn));
-	mvwprintw(game->prompt, 1, 0, "Move from? ");
-	wnoutrefresh(game->prompt);
-	wread(game->prompt, start, CMD_SIZ);
+
+	for (;;) {
+		wmove(game->prompt, 1, 0);
+		wclrtoeol(game->prompt);
+		mvwprintw(game->prompt, 1, 0, "Move from? ");
+		wnoutrefresh(game->prompt);
+		wread(game->prompt, start, INPUT_LEN);
+		if (!strcmp(start, "END")) {
+			mvwprintw(game->prompt, 1, 0, "End turn (ok/no)? ");
+			wread(game->prompt, start, INPUT_LEN);
+			if (!strcmp(start, "ok")) return 0;
+		} else break;
+	};
+
 	wprintw(game->prompt, " To? ");
-	wread(game->prompt, end, CMD_SIZ);
+	wread(game->prompt, end, INPUT_LEN);
 	wclear(game->prompt);
 	wnoutrefresh(game->prompt);
+	return 1;
 }
 
 size_t
-isvalidmv(const Game *game, int from, int to)
+isvalidmv(const Game *game, int from, int to, int isbar)
 {
 	size_t i;
 	int mv;
-	if (from < 0 || from > 23 || to < 0 || to > 23) return VALUE_ERR;
-	if (game->places[from].pl != game->turn)        return PLAYER_ERR;
+	if (isbar) {
+		if (game->bar[game->turn] == 0)                 return NO_CHECKERS_BAR_ERR;
+		if (!IS_HOME(OTHER_PLAYER(game->turn), to))     return IS_NOT_HOME_ERR;
+	} else {
+		if (game->bar[game->turn] != 0)                 return NON_EMPTY_BAR_ERR;
+		if (from < 0 || from > 23 || to < 0 || to > 23) return INDEX_UNBOUND_ERR;
+		if (game->places[from].pl != game->turn)        return IS_NOT_PLAYER_ERR;
+	}
+
 	if ((game->turn == ME  && from > to) ||
-        (game->turn == YOU && from < to))           return DIR_ERR;
+        (game->turn == YOU && from < to)) return MOVE_DIR_ERR;
+
 	if (game->places[to].pl == OTHER_PLAYER(game->turn) &&
-	    game->places[to].count > 1) return BEAT_ERR;
+	    game->places[to].count > 1) return CANT_BEAT_ERR;
+
 	for (mv = abs(from - to), i = 0; i < nelem(game->cube); i++)
 		if (game->cube[i].use && game->cube[i].val == mv) return i;
-	return NO_MOVE_ERR;
+	return NO_MOVE_ROLLED_ERR;
+}
+
+int
+parseinput(char *input, size_t *idx, char *keyword, int *iskeyword)
+{
+	char *endptr;
+
+	*idx = strtol(input, &endptr, 10) - 1;
+	if (input == endptr) {
+		if (!(*iskeyword = !strcmp(input, keyword))) return INVALID_INPUT_ERR;
+	} else if (*endptr != '\0') return INVALID_INPUT_ERR;
+	return 0;
 }
 
 int
 mvchecker(Game *game, char *start, char *end)
 {
-	char *endptr;
 	size_t from, to, idx;
+	int isbar, ishome, err;
 	int sign;
 
-	from = strtol(start, &endptr, 10) - 1;
-	if (start == endptr || *endptr != '\0') return VALUE_ERR;
-	sign = (*end == '-' ? -1 : (*end == '+' ? 1 : 0));
+	isbar = ishome = 0;
+	if ((err = parseinput(start, &from, "BAR", &isbar))) return err;
+	if (isbar) from = START_PLC(game->turn);
+
+	sign = (*end == '-' ? -1 : (*end == '+' ? 1 : 0)); /* if sign skip it */
 	if (sign) end++;
-	to = strtol(end, &endptr, 10) - 1;
+
+	if ((err = parseinput(end, &to, "HOME", &ishome))) return err;
+	if (ishome) to = -1;
 	if (sign) to = from + sign * (to + 1);
-	if (end == endptr || *endptr != '\0') return VALUE_ERR;
+
 	mvwprintw(game->root, 0, 0, "[%s] [%s] [%ld] [%ld]", start, end, from, to);
 	wrefresh(game->root);
-	if ((idx = isvalidmv(game, from, to)) >= nelem(game->cube)) return idx;
+	if ((idx = isvalidmv(game, from, to, isbar)) >= nelem(game->cube)) return idx;
+	if (game->places[to].pl == OTHER_PLAYER(game->turn)) { /* beating */
+		game->bar[OTHER_PLAYER(game->turn)] += 1;
+		game->places[to].count = 0;
+	}
 	game->places[to].pl = game->turn;
-	game->places[from].count--;
 	game->places[to].count++;
+	if (isbar) game->bar[game->turn]--;
+	else game->places[from].count--;
 	return idx;
+}
+
+
+/*
+ * ROLL 2 3 4 5 - roll and new turn
+ * BAR  22      - moves from bar to position
+ * MOVE 22 23   - moves from place to place
+*/
+int
+executecmd(Game *game, char *cmd, int *args)
+{
+	if (strcmp("ROLL", cmd)) {
+
+	} else if (strcmp("BAR", cmd)) {
+
+	} else if (strcmp("MOVE", cmd)) {
+		
+	} else {
+		return CMD_NAME_ERR;
+	}
+	return 0;
 }
 
 
@@ -378,7 +445,7 @@ int
 main()
 {
 	Game *game;
-	char start[CMD_SIZ], end[CMD_SIZ];
+	char start[INPUT_LEN], end[INPUT_LEN];
 	size_t i;
 
 	setup();
@@ -391,6 +458,8 @@ main()
 			rolldrw(game, ME,  "[%d]", game->cube[ME].val);
 			rolldrw(game, YOU, "[%d]", game->cube[YOU].val);
 			game->turn = game->cube[ME].val > game->cube[YOU].val ? ME : YOU;
+			game->cube[0].val = 1;
+			game->cube[1].val = 2;
 			game->state = RUN;
 			goto READ;
 		case RUN:
@@ -398,7 +467,7 @@ main()
 			rolldrw(game, game->turn, "[%d] [%d]", game->cube[0].val, game->cube[1].val);
 		READ:
 			for (;;) {
-				readprompt(game, start, end);
+				if (!readprompt(game, start, end)) break;
 				if ((i = mvchecker(game, start, end)) < nelem(game->cube)) {
 					boarddrw(game);
 					game->cube[i].use--;
@@ -406,7 +475,7 @@ main()
 					continue;
 				}
 				/* INVALID MOVE */
-				curs_set(0); 
+				curs_set(0);
 				wclear(game->prompt);
 				mvwprintw(game->prompt, 0, 0, ERR_STR[i], start, end);
 				wrefresh(game->prompt);
