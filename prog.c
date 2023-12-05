@@ -1,16 +1,18 @@
-/* ANSI C GAMMON */
+/* ANSI C GAMMON                               -*- c-default-style "linux" -*- */
 #include <curses.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include <locale.h> /* extend ASCII ncurses */
 #include <ncursesw/curses.h>
 
+#define SAVE_FILE        "gmsave"
 #define PLAYER_COUNT     2
 #define DICE_COUNT       2
 #define TITLE            "The Game of GAMMON by yan3ku v0.1"
-#define ROLL_PROMPT(p)   "%s roll> ", ROLL_STR[(p)]
-#define OTHER_PLAYER(p)   ((p) == ME ? YOU : (p) == YOU ? ME : EMPTY)
+#define ROLL_PROMPT(p)   "%s roll> ", (p == ME ? "My" : "Your")
+#define OTHER_PLAYER(p)       ((p) == ME ? YOU : (p) == YOU ? ME : EMPTY)
 #define nelem(x)         (sizeof(x) / sizeof(*x))
 #define TERM_SIZE_ERR    "Terminal window too small!"
 #define PLAYER_SYM(pl)   ((pl) == ME ? "░░" : "▓▓")
@@ -19,14 +21,18 @@
 #define INPUT_LEN        5
 #define CMD_SIZ          5
 #define ERR_DISP_TIME    2000
-#define IS_HOME(pl, plc) ((pl) == ME ? (plc) >= 18 : (plc) <= 5)
-#define IS_EXE_ERR(x)    ((x) >= DICE_COUNT)
-
-/* not used as indexes but for calculations of distance */
-#define START_PLC(pl)    ((pl) == ME ? -1 : 24)
-#define BEAROFF_PLC(pl)  ((pl) == ME ? 24 : -1)
-#define FST_ARG(cmd, pl) ((cmd).args[0].type == BAR_ARG ?  START_PLC(pl)   : (cmd).args[0].id)
-#define SND_ARG(cmd, pl) ((cmd).args[1].type == HOME_ARG ? BEAROFF_PLC(pl) : (cmd).args[1].id)
+#define IS_HOME(pl, plc) ((pl) == ME ? 19 <= (plc) && (plc) <= BOARD_END : BOARD_BEG <= (plc) && (plc) <= 6)
+#define IS_ERR(x)        ((x) >= DICE_COUNT)
+#define BOARD_WIDTH      24
+#define PLACES_SIZ       (BOARD_WIDTH + 2)
+#define BOARD_BEG        1
+#define BOARD_END        24
+#define CHECKER_COUNT    15
+/* not used as indexes to game.places array but for calculations of distance */
+#define MOVE_DIR(pl)     (pl ? -1 : +1);
+#define START_PLC(pl)    ((pl) == ME ? BOARD_BEG - 1 : BOARD_END + 1)
+#define BEAROFF_PLC(pl)  ((pl) == ME ? BOARD_END + 1 : BOARD_BEG - 1)
+#define HOME(game, pl)   ((game).places[BEAROFF_PLC(pl)].count)
 
 
 typedef enum {
@@ -36,16 +42,17 @@ typedef enum {
 } Player;
 
 typedef enum {
+	MENU,
+	STEP,
 	START,
-	RUN,
+	PLAY,
 	END,
 } State;
 
 typedef enum {
-	INDEX_UNBOUND_ERR = PLAYER_COUNT, /* if function returns player it's not error */
+	INDEX_UNBOUND_ERR = DICE_COUNT, /* if function returns dice index it's not error */
 	CMD_NAME_ERR,
 	INVALID_INPUT_ERR,
-	INPUT_ERR,
 	MOVE_DIR_ERR,
 	IS_NOT_PLAYER_ERR,
 	CANT_BEAT_ERR,
@@ -54,15 +61,25 @@ typedef enum {
 	IS_NOT_HOME_ERR,
 	NO_MOVE_ROLLED_ERR,
 	CANT_BEAROFF_ERR,
+	HAVE_TO_BEAT_ERR,
 } ExeErr;
 
-
-enum {
-	OUTERB_START = 6,
-	OUTERB_END   = 17,
+const char *ERR_STR[] = {
+	[INDEX_UNBOUND_ERR]   = "No such place exist!",
+	[INVALID_INPUT_ERR]   = "Wrong input! Usefull words: BAR, HOME, OUT",
+	[MOVE_DIR_ERR]        = "Wrong movement direction!",
+	[IS_NOT_PLAYER_ERR]   = "No checkers to move there!",
+	[CANT_BEAT_ERR]       = "You can't beat the opposing player!",
+	[NO_MOVE_ROLLED_ERR]  = "No such move was rolled!",
+	[NON_EMPTY_BAR_ERR]   = "You have checkers on bar!",
+	[NO_CHECKERS_BAR_ERR] = "No checkers on bar!",
+	[IS_NOT_HOME_ERR]     = "Position must be home!",
+	[CANT_BEAROFF_ERR]    = "You can't bearoff right now!",
+	[HAVE_TO_BEAT_ERR]    = "You have to beat another player!",
+	[CMD_NAME_ERR]        = "No such command!",
 };
 
-enum { /* spaces */
+enum { /* sizes used for spaces between piles */
 	PILE_COLS      = 2,
 	PILE_LINES     = 6,
 	PILE_GAP_LINES = 3,
@@ -70,7 +87,7 @@ enum { /* spaces */
 	BAR_COLS       = 3
 };
 
-enum { /* windows */
+enum { /* sizes used for drawing windows */
 	BOARDER      = 2,
 	PROMPT_LINES = 2,
 	HOME_COLS    = 7,
@@ -86,27 +103,35 @@ typedef struct {
 } Dice;
 
 typedef enum {
-	BAR_ARG,
-	HOME_ARG,
-	PLC_ARG,
-} CmdArgType;
+	BAR_WORD,
+	HOME_WORD,
+	PLC_WORD,
+} MoveKey;
 
 typedef struct {
-	CmdArgType type;
-	int id;
-} CmdArg;
+	MoveKey keyword; /* HOME, BAR or index to game.places array */
+	int pos;
+}  PlcId;
+
+typedef struct {
+	PlcId from, to;
+} MoveCmd;
 
 const char *ARG_TYPE2STR[] = {
-	[BAR_ARG] = "BAR",
-	[HOME_ARG] = "HOME",
+	[BAR_WORD] = "BAR",
+	[HOME_WORD] = "HOME",
 };
 
+/* the Cmd* represents turn execution in game */
 typedef struct {
 	enum {
 		MOVE_CMD,
 		ROLL_CMD,
 	} type;
-	CmdArg args[4];
+	union {
+		MoveCmd move;
+		int roll[4];
+	} get;
 } Cmd;
 
 typedef struct {
@@ -115,34 +140,19 @@ typedef struct {
 } Place;
 
 typedef struct {
-	Place places[24];
+	Place places[PLACES_SIZ]; /* BOARD_WIDTH + 2, the 2 edges are home places */
 	int bar[PLAYER_COUNT];
-	int home[PLAYER_COUNT];
 	Player turn;
 	State state;
+	int score[PLAYER_COUNT];
 	Dice dice[DICE_COUNT];
+	int fstturn;
 	WINDOW *root;
 	WINDOW *board;
 	WINDOW *roll[PLAYER_COUNT];
 	WINDOW *prompt;
-	WINDOW *score;
 	WINDOW *whome;
 } Game;
-
-const char *ERR_STR[] = {
-	[INDEX_UNBOUND_ERR]   = "No such place exist!",
-	[INVALID_INPUT_ERR]   = "Wrong input! Usefull words: BAR, HOME, OUT",
-	[MOVE_DIR_ERR]        = "Wrong movement direction!",
-	[IS_NOT_PLAYER_ERR]   = "No checkers to move there!",
-	[CANT_BEAT_ERR]       = "You can't beat the opposing player!",
-	[NO_MOVE_ROLLED_ERR]  = "No such move was rolled!",
-	[NON_EMPTY_BAR_ERR]   = "You have checkers on bar!",
-	[NO_CHECKERS_BAR_ERR] = "No checkers on bar!",
-	[IS_NOT_HOME_ERR]     = "Position must be home!",
-	[CANT_BEAROFF_ERR]    = "You can't bearoff right now!"
-};
-
-const char *ROLL_STR[] = {"My", "Your"};
 
 void
 setup()
@@ -157,41 +167,49 @@ setup()
 	use_default_colors();
 }
 
+void
+initboard(Game *game)
+{
+	size_t i;
+
+	for (i = 0; i < PLACES_SIZ; i++) {
+		game->places[i].pl = EMPTY;
+	}
+
+	game->places[1]  = (Place){.pl = ME,  .count = 2};
+	game->places[6]  = (Place){.pl = YOU, .count = 5};
+	game->places[8]  = (Place){.pl = YOU, .count = 3};
+	game->places[12] = (Place){.pl = ME,  .count = 5};
+
+	for (i = BOARD_BEG; i < PLACES_SIZ / 2; i++) {
+		game->places[PLACES_SIZ - i - 1].pl = OTHER_PLAYER(game->places[i].pl);
+		game->places[PLACES_SIZ - i - 1].count = game->places[i].count;
+	}
+}
+
 Game *
 gamecreate()
 {
 	Game *game;
-	size_t i;
 
 	game = calloc(1, sizeof *game);
-	for (i = 0; i < 12; i++) {
-		game->places[i].pl = EMPTY;
-	}
+	game->fstturn = 1;
+	initboard(game);
+	HOME(*game, ME) = 14;
+	game->places[24]  = (Place){.pl = ME,  .count = 1};
+	game->places[19]  = (Place){.pl = ME,  .count = 0};
+
 
 	/*
-	   game->places[0]  = (Place){.pl = ME,  .count = 2};
-	   game->places[5]  = (Place){.pl = YOU, .count = 5};
-	   game->places[7]  = (Place){.pl = YOU, .count = 3};
-	   game->places[11] = (Place){.pl = ME,  .count = 5};
 	*/
 
-	game->places[0]  = (Place){.pl = YOU,  .count = 5};
-	game->places[1]  = (Place){.pl = YOU, .count = 10};
-	game->bar[ME] = 0;
-	game->bar[YOU] = 0;
-	game->home[YOU] = 0;
-	game->home[ME] = 0;
 
-	for (i = 0; i < 12; i++) {
-		game->places[23 - i].pl = OTHER_PLAYER(game->places[i].pl);
-		game->places[23 - i].count = game->places[i].count;
-	}
-
-	game->state = START;
+	game->state = MENU;
 	return game;
 }
 
 /*
+ * "Place to screen function"
  * Here is how the internal board layout looks:
  * HORIZONTAL:
  * <gap> 6*(<plc> <gap>) <bar> <gap> 6*(<plc> <gap>)
@@ -203,13 +221,13 @@ gamecreate()
 void
 plctoscr(int i, int j, int *y, int *x)
 {
-	int col = abs(11 - i) - (i > 11);
+	int col = abs((PLACES_SIZ / 2) - i - 1) - (i >= (PLACES_SIZ / 2));
 	int bar = col < 6 ? 0 : BAR_COLS + PILE_GAP_COLS;
 	*x = PILE_GAP_COLS + col * (PILE_GAP_COLS + PILE_COLS) + bar + 1;
-	*y = (i < 12 ? BOARD_LINES - j - 2 : j + 1);
+	*y = (i < (PLACES_SIZ / 2) ? BOARD_LINES - j - 2 : j + 1);
 }
 
-const char *
+const char * /* player to symbol (for drawing) */
 plctosym(const Place *plc, int i, int j)
 {
 	static char str[3];
@@ -223,6 +241,14 @@ plctosym(const Place *plc, int i, int j)
 }
 
 void
+scoredrw(Game *game)
+{
+	char buff[64];
+	sprintf(buff, "SCORE: Me %d, You %d", game->score[ME], game->score[YOU]);
+	mvwaddstr(game->root, 0, ROOT_COLS - strlen(buff), buff);
+}
+
+void /* this function name means board draw (drw) btw */
 boarddrw(Game *game)
 {
 	size_t i, j;
@@ -241,19 +267,21 @@ boarddrw(Game *game)
 	}
 
 	for (i = 0; i < 2; i++) { /* home */
-		for (j = 0; j < (size_t)game->home[i]; j++) {
+		for (j = 0; j < (size_t)HOME(*game, i); j++) {
 			y = (i == YOU ? BOARD_LINES - 2 - j % 5 : j % 5 + 1);
 			mvwaddstr(game->whome, y, j / 5 * 2, PLAYER_SYM(i));
 		}
 	}
+
 	mvwprintw(game->whome, BOARD_LINES / 2, 0, "[HOME]");
 
-	for (i = 0; i < nelem(game->places); i++)  { /* places */
+	for (i = BOARD_BEG; i <= BOARD_END; i++)  { /* places */
 		for (j = 0; j < 6; j++) {
 			plctoscr(i, j, &y, &x);
 			mvwaddstr(game->board, y, x, plctosym(game->places, i, j));
 		}
 	}
+	scoredrw(game);
 
 	wnoutrefresh(game->whome);
 	wnoutrefresh(game->board);
@@ -275,17 +303,19 @@ gameinitdrw(Game *game)
 	game->root  = newwin(ROOT_LINES, ROOT_COLS,
 	                     (LINES - ROOT_LINES) / 2,
 	                     (COLS  - ROOT_COLS)  / 2);
+	mvwaddstr(game->root, 0, 0, TITLE);
+
 	game->board = derwin(game->root, BOARD_LINES, BOARD_COLS, 3, 0);
+	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
 	boardendy   = getpary(game->board) + getmaxy(game->board);
 
-	plctoscr(13, 0, &y, &x); /* 13 place pos */
+	plctoscr(14, 0, &y, &x); /* 14 places is at the left center */
 	game->roll[0] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
-	plctoscr(19, 0, &y, &x);
+	plctoscr(20, 0, &y, &x); /* 20 places is at the right center */
 	game->roll[1] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
+
 	game->prompt  = derwin(game->root, PROMPT_LINES, BOARD_COLS, boardendy + 2, 0);
-	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
-	mvwaddstr(game->root, 0, 0, TITLE);
-	mvwaddstr(game->prompt, 0, 0, TITLE);
+
 	game->whome = derwin(game->root, BOARD_LINES, HOME_COLS, getpary(game->board), BOARD_COLS);
 	mvwhline(game->whome, 0, 0, '=', HOME_COLS);
 	mvwhline(game->whome, BOARD_LINES - 1, 0, '=', HOME_COLS);
@@ -293,9 +323,9 @@ gameinitdrw(Game *game)
 
 	boarddrw(game);
 
-	for (i = 0, j = 0; i < nelem(game->places); i++) {
+	for (i = BOARD_BEG, j = 0; i <= BOARD_END; i++) {
 		plctoscr(i, j, &y, &x);
-		mvwprintw(game->root, i < 12 ? boardendy : getpary(game->board) - 1, x, "%2ld", i + 1);
+		mvwprintw(game->root, i < 13 ? boardendy : getpary(game->board) - 1, x, "%2ld", i);
 	}
 
 	wnoutrefresh(stdscr);
@@ -383,12 +413,12 @@ int
 canbearoff(const Game *game)
 {
 	int count, i;
-	for (count = 0, i = 0; i < nelem(game->places); i++) {
+	for (count = 0, i = BOARD_BEG; i <= BOARD_END; i++) {
 		if (IS_HOME(game->turn, i) && game->places[i].pl == game->turn) {
 			count += game->places[i].count;
 		}
 	}
-	count += game->home[game->turn];
+	count += HOME(*game, game->turn);
 	return count == 15;
 }
 
@@ -412,99 +442,183 @@ int
 islastchecker(const Game *game, int pos)
 {
 	int dir, i;
-	dir = (game->turn ? -1 : +1);
-	for (i = BEAROFF_PLC(game->turn) - 6 * dir; 0 < i && i < 24; i += dir) {
+	dir = MOVE_DIR(game->turn);
+	for (i = BEAROFF_PLC(game->turn) - 6 * dir; BOARD_BEG <= i && i <= BOARD_END; i += dir) {
 		if (game->places[i].pl == game->turn) { return i == pos; }
 	}
 	return -1;
 }
 
-ExeErr
-isvalidcmd(const Game *game, Cmd *cmd)
+int
+closest2bearoff(const Game *game, int old, int new)
 {
-	int idx, from, to;
+	int dist_old, dist_new;
+	if (old == 0) return new;
+	dist_old = abs(BEAROFF_PLC(OTHER_PLAYER(game->turn)) - old);
+	dist_new = abs(BEAROFF_PLC(OTHER_PLAYER(game->turn)) - new);
+	return dist_old < dist_new ? old : new;
+}
 
-	from = FST_ARG(*cmd, game->turn);
-	to   = SND_ARG(*cmd, game->turn);
+int
+isforcedbeating(const Game *game)
+{
+	int dir, i, j, pos, closest;
+	closest = 0;
+	dir = MOVE_DIR(game->turn);
 
-	if (cmd->args[0].type == BAR_ARG) {
-		if (game->bar[game->turn] == 0) { return NO_CHECKERS_BAR_ERR; }
-		if (cmd->args[1].type != PLC_ARG || !IS_HOME(OTHER_PLAYER(game->turn), cmd->args[1].id)) {
-			return IS_NOT_HOME_ERR;
+	/* check bar movement too */
+	if (game->bar[game->turn] > 0) {
+		for (j = 0; j < DICE_COUNT; j++) {
+			if (game->dice[j].use == 0) continue;
+			pos = START_PLC(game->turn) + game->dice[j].val * dir;
+			closest = closest2bearoff(game, closest, pos);
 		}
-	} else if (cmd->args[1].type == HOME_ARG) {
-		if (!canbearoff(game)) { return CANT_BEAROFF_ERR; }
-		if (!IS_HOME(game->turn, cmd->args[0].id)) { return IS_NOT_HOME_ERR; }
-		if (game->places[from].pl != game->turn) { return IS_NOT_PLAYER_ERR; }
-	} else {
-		if (game->bar[game->turn] != 0) { return NON_EMPTY_BAR_ERR; }
-		if (from < 0 || from > 23 || to < 0 || to > 23) { return INDEX_UNBOUND_ERR; }
-		if (game->places[from].pl != game->turn) { return IS_NOT_PLAYER_ERR; }
+		return closest;
 	}
 
+	/* regular movement between places */
+	for (i = BOARD_BEG; i <= BOARD_END; i++) {
+		if (game->places[i].pl == game->turn) {
+			for (j = 0; j < DICE_COUNT; j++) {
+				if (game->dice[j].use == 0) continue;
+				pos = i + game->dice[j].val * dir;
+				if (pos < BOARD_BEG || BOARD_END < pos) continue;
+				if (game->places[pos].pl != OTHER_PLAYER(game->turn)) continue;
+				if (game->places[pos].count > 1) continue;
+				closest = closest2bearoff(game, closest, pos);
+			}
+		}
+	}
+	return closest;
+}
+
+int
+isvaliddir(const Game *game, int from , int to)
+{
+
 	if ((game->turn == ME  && from > to) ||
-	    (game->turn == YOU && from < to)) {
-		return MOVE_DIR_ERR;
-	} 
+	    (game->turn == YOU && from < to))
+		return 0;
+	return 1;
+}
 
-	if (game->places[to].pl == OTHER_PLAYER(game->turn) && game->places[to].count > 1) {
-		return CANT_BEAT_ERR;
-	} 
+int
+havetobeat(const Game *game, int to)
+{
+	int pos;
+	if ((pos = isforcedbeating(game)) > 0)
+		if (pos != to) return 1;
+	return 0;
+}
 
-	if (!IS_EXE_ERR(idx = findmove(game->dice, abs(from - to), eq))) { return idx; }
-	if (cmd->args[1].type != HOME_ARG) { return NO_MOVE_ROLLED_ERR; }
-	/* 
+int /* special cases for either bearoffing, moving from bar, or regular movement */
+validatekeyword(const Game *game, MoveCmd *move)
+{
+	int from, to;
+	from = move->from.pos;
+	to   = move->to.pos;
+
+	if (move->from.keyword == BAR_WORD) {
+		if (game->bar[game->turn] == 0) return NO_CHECKERS_BAR_ERR;
+		if (!IS_HOME(OTHER_PLAYER(game->turn), to)) return IS_NOT_HOME_ERR;
+	} else if (move->to.keyword == HOME_WORD) {
+		if (!canbearoff(game)) return CANT_BEAROFF_ERR;
+		if (game->places[from].pl != game->turn) return IS_NOT_PLAYER_ERR;
+	} else {
+		if (game->bar[game->turn] != 0) return NON_EMPTY_BAR_ERR;
+		if (from < BOARD_BEG || from > BOARD_END || to < BOARD_BEG || to > BOARD_END) return INDEX_UNBOUND_ERR;
+		if (game->places[from].pl != game->turn) return IS_NOT_PLAYER_ERR;
+	}
+	return 0;
+}
+
+int
+cantbeat(const Game *game, int to)
+{
+	if (game->places[to].pl == OTHER_PLAYER(game->turn) && game->places[to].count > 1)
+		return 1;
+	return 0;
+}
+
+ExeErr
+isvalidcmd(const Game *game, MoveCmd *move)
+{
+	int idx, err, from, to;
+
+	from = move->from.pos;
+	to   = move->to.pos;
+	
+	if (IS_ERR(err = validatekeyword(game, move))) return err;
+	if (!isvaliddir(game, from, to)) return MOVE_DIR_ERR;
+	if (havetobeat(game, to))        return HAVE_TO_BEAT_ERR;
+	if (cantbeat(game, from))        return CANT_BEAT_ERR;
+
+	if (!IS_ERR(err = findmove(game->dice, abs(from - to), eq))) return err;
+	if (move->to.keyword != HOME_WORD) return NO_MOVE_ROLLED_ERR;
+	/*
 	 * there is special rule that says:
 	 * if the roll is greater than the distance from last checker to home you can bearoff it
 	 */
-	if (islastchecker(game, from) && !IS_EXE_ERR(idx = findmove(game->dice, abs(from - to), geq))) {
+	if (islastchecker(game, from) && !IS_ERR(idx = findmove(game->dice, abs(from - to), geq)))
 			return idx;
-	}
 	return NO_MOVE_ROLLED_ERR;
 }
 
 int
-parseinput(char *input, CmdArg *arg, CmdArgType type)
+parseinput(char *input, PlcId *plc, MoveKey keyword)
 {
 	char *endptr;
 
-	arg->id = strtol(input, &endptr, 10) - 1;
-	arg->type = PLC_ARG;
+	plc->pos = strtol(input, &endptr, 10);
+	plc->keyword = PLC_WORD;
 	if (input == endptr) {
-		if ((!strcmp(input, ARG_TYPE2STR[type]))) { arg->type = type; }
+		if ((!strcmp(input, ARG_TYPE2STR[keyword]))) { plc->keyword = keyword; }
 		else { return INVALID_INPUT_ERR; }
 	} else if (*endptr != '\0') { return INVALID_INPUT_ERR; }
 	return 0;
 }
 
 int
-parsecmdfromprompt(Cmd *cmd, const Game *game, char *start, char *end)
+parsecmdfromprompt(MoveCmd *move, const Game *game, char *start, char *end)
 {
 	int *from, *to;
 	int sign, err;
 
-	from = &cmd->args[0].id;
-	to   = &cmd->args[1].id;
+	from = &move->from.pos;
+	to   = &move->to.pos;
 
-	if ((err = parseinput(start, &cmd->args[0], BAR_ARG))) return err;
-	if (cmd->args[0].type == BAR_ARG) *from = START_PLC(game->turn);
+	if ((err = parseinput(start, &move->from, BAR_WORD))) return err;
+	if (move->from.keyword == BAR_WORD) *from = START_PLC(game->turn);
 
 	sign = (*end == '-' ? -1 : (*end == '+' ? 1 : 0)); /* if sign skip it */
 	if (sign) end++;
 
-	if ((err = parseinput(end, &cmd->args[1], HOME_ARG))) return err;
-	if (sign) *to = *from + sign * (*to + 1);
-	mvwprintw(game->root, 0, 0, "%d %d", *from , *to);
+	if ((err = parseinput(end, &move->to, HOME_WORD))) return err;
+	if (move->to.keyword == HOME_WORD) *to = BEAROFF_PLC(game->turn);
+	if (sign) *to = *from + sign * *to;
 	wrefresh(game->root);
-	
+
 	return 0;
 }
 
 
 void
-removecheckerat(Game *game, int pos)
+movechecker(Game *game, MoveCmd *move)
 {
-	if (!--game->places[pos].count) { game->places[pos].pl = EMPTY; }
+	int from , to;
+	from = move->from.pos;
+	to = move->to.pos;
+	/* beat checker and move them to bar */
+	if (game->places[to].pl == OTHER_PLAYER(game->turn)) {
+		game->bar[OTHER_PLAYER(game->turn)] += 1;
+		game->places[to].count = 0;
+	}
+	/* move it */
+	game->places[to].pl = game->turn;
+	game->places[to].count++;
+	/* remove from old position */
+	if (move->from.keyword == BAR_WORD) { game->bar[game->turn]--; }
+	else if (!--game->places[from].count) { game->places[from].pl = EMPTY; }
 }
 
 /*
@@ -515,7 +629,6 @@ int
 executecmd(Game *game, Cmd *cmd)
 {
 	size_t idx;
-	int from, to;
 
 	switch (cmd->type) {
 		case ROLL_CMD:
@@ -523,81 +636,167 @@ executecmd(Game *game, Cmd *cmd)
 			roll(game->dice);
 			return 0;
 		case MOVE_CMD:
-			if (IS_EXE_ERR(idx = isvalidcmd(game, cmd))) return idx;
-			from = FST_ARG(*cmd, game->turn);
-			if (cmd->args[1].type == HOME_ARG) {
-				game->home[game->turn]++;
-				removecheckerat(game, from);
-				return idx;
-			}
-			to = SND_ARG(*cmd, game->turn);
-			if (game->places[to].pl == OTHER_PLAYER(game->turn)) { /* beating */
-				game->bar[OTHER_PLAYER(game->turn)] += 1;
-				game->places[to].count = 0;
-			}
-			game->places[to].pl = game->turn;
-			game->places[to].count++;
-			if (cmd->args[0].type == BAR_ARG) { game->bar[game->turn]--; }
-			else { removecheckerat(game, from); }
+			if (IS_ERR(idx = isvalidcmd(game, &cmd->get.move))) return idx;
+			movechecker(game, &cmd->get.move);
 			return idx;
 		default: return CMD_NAME_ERR;
 	}
 }
 
+int
+savecmd(FILE *file, Cmd *cmd)
+{
+
+
+}
+
+int
+opensave(Game *game)
+{
+	char filename[128];
+	echo();
+	wclear(game->prompt);
+	mvwprintw(game->prompt, 0, 0, "Save path: ");
+	wrefresh(game->prompt);
+	wgetnstr(game->prompt, filename, 128);
+	if (!fopen(filename, "r")) {
+		wclear(game->prompt);
+		mvwaddstr(game->prompt, 0, 0, strerror(errno));
+		wrefresh(game->prompt);
+		napms(2000);
+		game->state = END;
+		return errno;
+	}
+	game->state = END;
+	noecho();
+	return 0;
+}
+
+
+void
+gamemenu(Game *game)
+{
+	char select;
+	gameinitdrw(game);
+	curs_set(0);
+	do {
+		mvwprintw(game->prompt, 0, 0, "(L)OAD/(P)LAY");
+		wrefresh(game->prompt);
+		select = getch();
+	} while (select != 'P' && select != 'L');
+	switch (select) {
+		case 'L': opensave(game); break;
+		case 'P':
+			game->state = START;
+			break;
+	}
+	curs_set(1);
+}
+
+void
+gamestart(Game *game)
+{
+	do { roll(game->dice); } while (game->dice[0].val == game->dice[1].val);
+	rolldrw(game, ME,  "[%d]", game->dice[ME].val);
+	rolldrw(game, YOU, "[%d]", game->dice[YOU].val);
+	game->turn = game->dice[ME].val > game->dice[YOU].val ? ME : YOU;
+	game->dice[0].val = 1;
+	game->dice[1].val = 2;
+	game->state = PLAY;
+}
+
+void
+errordrw(Game *game, int err)
+{
+	curs_set(0);
+	wclear(game->prompt);
+	mvwaddstr(game->prompt, 0, 0, ERR_STR[err]);
+	wrefresh(game->prompt);
+	napms(ERR_DISP_TIME);
+	curs_set(1);
+	wclear(game->prompt);
+}
+
+int
+playerwon(Game *game)
+{
+	return HOME(*game, game->turn) == CHECKER_COUNT;
+}
+
+void
+updatescore(Game *game)
+{
+	int *score = &game->score[game->turn];
+	if (game->bar[OTHER_PLAYER(game->turn)]) {
+		*score += 3;
+	} else if (HOME(*game, OTHER_PLAYER(game->turn))) {
+		*score += 2;
+	} else *score += 1;
+	scoredrw(game);
+	wnoutrefresh(game->root);
+}
+
+void
+gameplay(Game *game)
+{
+	Cmd cmd;
+	char start[INPUT_LEN], end[INPUT_LEN];
+	size_t i; /* this is either index or error i love c error handling btw */
+
+	if (!game->fstturn) {
+		roll(game->dice);
+		rolldrw(game, game->turn, "[%d] [%d]", game->dice[0].val, game->dice[1].val);
+	}
+
+	for (;;) {
+		cmd.type = MOVE_CMD;
+		if (readprompt(game, start, end)) break;
+		if (!IS_ERR(i = parsecmdfromprompt(&cmd.get.move, game, start, end)) &&
+				!IS_ERR(i = executecmd(game, &cmd))) {
+			boarddrw(game);
+			game->dice[i].use--;
+			if (!game->dice[0].use && !game->dice[1].use) break;
+			continue;
+		}
+		errordrw(game, i);
+	}
+
+	if (playerwon(game)) {
+		updatescore(game);
+		initboard(game);
+		boarddrw(game);
+		mvwprintw(game->prompt, 0, 0, "Player won");
+		wrefresh(game->prompt);
+		napms(2000);
+		game->state = START;
+	}
+	wclear(game->roll[game->turn]);
+	wnoutrefresh(game->roll[game->turn]);
+	game->turn = OTHER_PLAYER(game->turn);
+	game->fstturn = 0;
+}
+
+void
+gameend(Game *game)
+{
+
+}
 
 int
 main()
 {
 	Game *game;
-	Cmd cmd;
-	char start[INPUT_LEN], end[INPUT_LEN];
-	size_t i; /* this is either index or error i love c error handling btw */
 
 	setup();
 	game = gamecreate();
 	for (;;) {
 		switch (game->state) {
-		case START:
-			gameinitdrw(game);
-			do { roll(game->dice); } while (game->dice[0].val == game->dice[1].val);
-			rolldrw(game, ME,  "[%d]", game->dice[ME].val);
-			rolldrw(game, YOU, "[%d]", game->dice[YOU].val);
-			game->turn = game->dice[ME].val > game->dice[YOU].val ? ME : YOU;
-			game->dice[0].val = 1;
-			game->dice[1].val = 2;
-			game->state = RUN;
-			goto READ;
-		case RUN:
-			roll(game->dice);
-			rolldrw(game, game->turn, "[%d] [%d]", game->dice[0].val, game->dice[1].val);
-		READ:
-			/* readprompt -> parsecmdfromprompt -> executecmd */
-			for (;;) {
-				if (readprompt(game, start, end)) break;
-				if (!IS_EXE_ERR(i = parsecmdfromprompt(&cmd, game, start, end)) &&
-				    !IS_EXE_ERR(i = executecmd(game, &cmd))) {
-						boarddrw(game);
-						game->dice[i].use--;
-						if (!game->dice[0].use && !game->dice[1].use) break;
-						continue;
-				}
-				curs_set(0);
-				wclear(game->prompt);
-				mvwprintw(game->prompt, 0, 0, ERR_STR[i], start, end);
-				wrefresh(game->prompt);
-				napms(ERR_DISP_TIME);
-				curs_set(1);
-				wclear(game->prompt);
-			}
-			wclear(game->roll[game->turn]);
-			wnoutrefresh(game->roll[game->turn]);
-			game->turn = OTHER_PLAYER(game->turn);
-			break;
-		case END:
-			goto END;
+		case MENU:  gamemenu(game); break;
+		case START: gamestart(game); break;
+		case PLAY:  gameplay(game); break;
+		case END:   gameend(game); break;
 		}
 	}
-END:
 	endwin();
 	free(game);
 	return 0;
