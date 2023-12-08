@@ -1,4 +1,4 @@
-/* ANSI C GAMMON                               -*- c-default-style "linux" -*- */
+/* BACKGAMMON */
 #include <curses.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/sendfile.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <locale.h> /* extend ASCII ncurses */
 #include <ncursesw/curses.h>
 
@@ -16,14 +17,14 @@
 #define DICE_COUNT       2
 #define TITLE            "The Game of GAMMON by yan3ku v0.1"
 #define ROLL_PROMPT(p)   "%s roll> ", (p == ME ? "My" : "Your")
-#define OTHER_PLAYER(p)  ((p) == ME ? YOU : (p) == YOU ? ME : EMPTY)
+#define OTHER_PLAYER(p)  ((p) != EMPTY ? (p + 1) % 2 : EMPTY)
 #define nelem(x)         (sizeof(x) / sizeof(*x))
 #define TERM_SIZE_ERR    "Terminal window too small!"
 #define PLAYER_SYM(pl)   ((pl) == ME ? "░░" : "▓▓")
 #define PLAYER_DIR(pl)   ((pl) == ME ? "low to high" : "high to low")
 #define UNUSED(p)        (void)(p)
 #define INPUT_LEN        5
-#define CMD_SIZ          5
+#define CMD_SIZ          4
 #define ERR_DISP_TIME    2000
 #define IS_HOME(pl, plc) ((pl) == ME ? 19 <= (plc) && (plc) <= BOARD_END : BOARD_BEG <= (plc) && (plc) <= 6)
 #define IS_ERR(x)        ((x) >= DICE_COUNT)
@@ -32,11 +33,30 @@
 #define BOARD_BEG        1
 #define BOARD_END        24
 #define CHECKER_COUNT    15
-/* not used as indexes to game.places array but for calculations of distance */
 #define MOVE_DIR(pl)     (pl ? -1 : +1);
 #define START_PLC(pl)    ((pl) == ME ? BOARD_BEG - 1 : BOARD_END + 1)
 #define BEAROFF_PLC(pl)  ((pl) == ME ? BOARD_END + 1 : BOARD_BEG - 1)
 #define HOME(game, pl)   ((game).places[BEAROFF_PLC(pl)].count)
+
+#define notify(game, ...) do {                                       \
+	curs_set(0);                                                     \
+	wclear(game->prompt);                                            \
+	mvwprintw(game->prompt, 0, 0, __VA_ARGS__);                      \
+	wrefresh(game->prompt);                                          \
+	napms(ERR_DISP_TIME);                                            \
+	curs_set(1);                                                     \
+} while (0)
+
+#define enotify(game, ...) notify(game, "%s: %s", __VA_ARGS__, strerror(errno))
+
+#define die(game, ...) {                                           \
+	notify(game, __VA_ARGS__);                                     \
+	endwin();                                                      \
+	exit(1);                                                       \
+}
+
+#define edie(game, ...) die(game, "%s: %s", __VA_ARGS__, strerror(errno))
+
 
 
 typedef enum {
@@ -68,11 +88,12 @@ typedef enum {
 	NO_MOVE_ROLLED_ERR,
 	CANT_BEAROFF_ERR,
 	HAVE_TO_BEAT_ERR,
+	END_TURN_ERR,
 } ExeErr;
 
 const char *ERR_STR[] = {
 	[INDEX_UNBOUND_ERR]   = "No such place exist!",
-	[INVALID_INPUT_ERR]   = "Wrong input! Usefull words: BAR, HOME, OUT",
+	[INVALID_INPUT_ERR]   = "Wrong input! Usefull words: BAR, HOME, END, SAVE",
 	[MOVE_DIR_ERR]        = "Wrong movement direction!",
 	[IS_NOT_PLAYER_ERR]   = "No checkers to move there!",
 	[CANT_BEAT_ERR]       = "You can't beat the opposing player!",
@@ -128,18 +149,6 @@ const char *KEYWORD2STR[] = {
 	[HOME_WORD] = "HOME",
 };
 
-/* the Cmd* represents turn execution in game */
-typedef struct {
-	enum {
-		MOVE_CMD,
-		ROLL_CMD,
-	} type;
-	union {
-		MoveCmd move;
-		int roll[4];
-	} get;
-} Cmd;
-
 typedef struct {
 	Player pl;
 	int count;
@@ -154,6 +163,7 @@ typedef struct {
 	Dice dice[DICE_COUNT];
 	int fstturn;
 	FILE *save;
+	int steping;
 	WINDOW *root;
 	WINDOW *board;
 	WINDOW *roll[PLAYER_COUNT];
@@ -207,18 +217,15 @@ gamecreate()
 	game = calloc(1, sizeof *game);
 	game->fstturn = 1;
 	initboard(game);
-	HOME(*game, ME) = 14;
-	game->places[23]  = (Place){.pl = ME,  .count = 1};
-	game->places[21]  = (Place){.pl = YOU,  .count = 1};
-	game->places[20]  = (Place){.pl = ME,  .count = 3};
-	game->places[19]  = (Place){.pl = YOU,  .count = 3};
-	game->places[18]  = (Place){.pl = YOU,  .count = 2};
-	game->places[22]  = (Place){.pl = ME,  .count = 1};
-
-
 	/*
+	   HOME(*game, ME) = 14;
+	   game->places[23]  = (Place){.pl = ME,  .count = 1};
+	   game->places[21]  = (Place){.pl = YOU,  .count = 1};
+	   game->places[20]  = (Place){.pl = ME,  .count = 3};
+	   game->places[19]  = (Place){.pl = YOU,  .count = 3};
+	   game->places[18]  = (Place){.pl = YOU,  .count = 2};
+	   game->places[22]  = (Place){.pl = ME,  .count = 1};
 	*/
-
 
 	game->state = MENU;
 	return game;
@@ -353,11 +360,55 @@ gameinitdrw(Game *game)
 }
 
 void
-roll(Dice dice[2])
+savewrite_roll(FILE *save, Dice dice[2])
+{
+	int i, j;
+	fprintf(save, "ROL ");
+	for (i = 0; i < DICE_COUNT; i++) {
+		for (j = 0; j < dice[i].use; j++)
+			fprintf(save, "%d ", dice[i].val);
+	}
+	fprintf(save, "\n");
+}
+
+void
+readdice(Game *game)
+{
+	char ch;
+	int i;
+	char cmdname[CMD_SIZ];
+	i = 0;
+	fread(cmdname, CMD_SIZ - 1, 1, game->save);
+	cmdname[CMD_SIZ - 1] = '\0';
+	if (strcmp(cmdname, "ROL")) {
+		die(game, "expected ROL command");
+	}
+	game->dice[0].use = game->dice[1].use = 1;
+	while ((ch = fgetc(game->save)) != '\n' && ch != EOF) {
+		if (isdigit(ch)) {
+			ungetc(ch, game->save);
+			fscanf(game->save, "%d", &game->dice[i++].val);
+		}
+		if (i == 2 && game->dice[0].val == game->dice[1].val) {
+			i = 1;
+			game->dice[0].use = 2;
+		}
+		if (i > 3) die(game, "to many argument to ROL");
+	}
+}
+
+void
+roll(Game *game)
 {
 	int i;
-	for (i = 0; i < 2; i++) dice[i].val = rand() % 6 + 1;
-	dice[0].use = dice[1].use = (dice[0].val == dice[1].val ? 2 : 1);
+	if (game->steping) {
+		readdice(game);
+		return;
+	}
+
+	for (i = 0; i < 2; i++) game->dice[i].val = rand() % 6 + 1;
+	game->dice[0].use = game->dice[1].use = (game->dice[0].val == game->dice[1].val ? 2 : 1);
+	if (!game->steping) savewrite_roll(game->save, game->dice);
 }
 
 #define rolldrw(game, player, str, ...) do {                                   \
@@ -370,8 +421,8 @@ int /* newline consuming alternative to wget */
 wread(WINDOW *win, char *input, int maxlen)
 {
 	int ch;
-	*input = '\0';
 	char *beg = input;
+	*input = '\0';
 	noecho();
 	doupdate();
 	keypad(win, TRUE);
@@ -396,27 +447,55 @@ wread(WINDOW *win, char *input, int maxlen)
 }
 
 int
+savewrite(Game *game)
+{
+	char buff[64];
+	FILE *save;
+	size_t size;
+
+	wclear(game->prompt);
+	mvwaddstr(game->prompt, 0, 0, "File path for save file: ");
+	wgetnstr(game->prompt, buff, 64);
+	mvwprintw(game->root, 0, 0, "%s", buff);
+	wrefresh(game->root);
+	if (!(save = fopen(buff, "w")))
+		return errno;
+	size = ftell(game->save);
+	fseek(game->save, 0, SEEK_SET);
+	if (sendfile(fileno(save), fileno(game->save), NULL, size) < 0)
+		return errno;
+	fclose(save);
+	return 0;
+}
+
+int
 readprompt(Game *game, char *start, char *end)
 {
 	int i, j;
 	*start = '\0';
 	*end = '\0';
-	mvwprintw(game->prompt, 0, 0, "You %s have ", PLAYER_SYM(game->turn));
-	for (i = 0; i < 2; i++)
-		for (j = 0; j < game->dice[i].use; j++)
-			wprintw(game->prompt, "[%d] ", game->dice[i].val);
-	wprintw(game->prompt, "left, moving from %s", PLAYER_DIR(game->turn));
 
 	for (;;) {
-		wmove(game->prompt, 1, 0);
-		wclrtoeol(game->prompt);
+		wclear(game->prompt);
+		mvwprintw(game->prompt, 0, 0, "You %s have ", PLAYER_SYM(game->turn));
+		for (i = 0; i < 2; i++)
+			for (j = 0; j < game->dice[i].use; j++)
+				wprintw(game->prompt, "[%d] ", game->dice[i].val);
+		wprintw(game->prompt, "left, moving from %s", PLAYER_DIR(game->turn));
 		mvwprintw(game->prompt, 1, 0, "Move from? ");
 		wnoutrefresh(game->prompt);
 		wread(game->prompt, start, INPUT_LEN);
 		if (!strcmp(start, "END")) {
 			mvwprintw(game->prompt, 1, 0, "End turn (ok/no)? ");
-			wread(game->prompt, start, INPUT_LEN);
-			if (!strcmp(start, "ok")) return 1;
+			wread(game->prompt, start, 3);
+			if (!strcmp(start, "ok")) return END_TURN_ERR;
+		} if (!strcmp(start, "SAVE")){
+			if (savewrite(game)) {
+				enotify(game, "can't save game");
+				continue;
+			}
+			notify(game, "Game saved!");
+			continue;
 		} else break;
 	};
 
@@ -517,7 +596,6 @@ isforcedbeating(const Game *game)
 	int i, closest;
 	closest = START_PLC(OTHER_PLAYER(game->turn));
 
-	wmove(game->root, 0, 0);
 	if (game->bar[game->turn] > 0) {
 		return findbeating(game, START_PLC(game->turn));
 	}
@@ -609,7 +687,7 @@ parseinput(char *input, PlcId *plc, MoveKey keyword)
 }
 
 int
-parsecmdfromprompt(MoveCmd *move, const Game *game, char *start, char *end)
+cmdparse(MoveCmd *move, const Game *game, char *start, char *end)
 {
 	int *from, *to;
 	int sign, err;
@@ -652,28 +730,11 @@ movechecker(Game *game, MoveCmd *move)
 }
 
 /*
- * ROLL 2 3 4 5  - roll and switch player (used when reading save)
- * MOVE BAR 23   - moves from place to place (basically like the prompt)
- * TODO: Probably good idea to add anotations to ROLL which player turn is it
+ * ROL 2 3 4 5   - roll and switch player
+ * MOV BAR 23    - moves from place to place (basically like the prompt)
+ * END           - explicitly end turn
+ * TODO: Probably good idea to add anotations to ROL which player turn is it
 */
-int
-executecmd(Game *game, Cmd *cmd)
-{
-	size_t idx;
-
-	switch (cmd->type) {
-		case ROLL_CMD:
-			game->turn = OTHER_PLAYER(game->turn);
-			roll(game->dice);
-			return 0;
-		case MOVE_CMD:
-			if (IS_ERR(idx = isvalidcmd(game, &cmd->get.move))) return idx;
-			movechecker(game, &cmd->get.move);
-			return idx;
-		default: return CMD_NAME_ERR;
-	}
-}
-
 const char *
 plcidstr(PlcId plc, MoveKey keyword)
 {
@@ -688,37 +749,31 @@ plcidstr(PlcId plc, MoveKey keyword)
 }
 
 void
-savemvcmd(FILE *file, MoveCmd *cmd)
+savewrite_mov(FILE *save, MoveCmd *cmd)
 {
-	fprintf(file, "MOVE %s %s\n", plcidstr(cmd->from, BAR_WORD), plcidstr(cmd->from, HOME_WORD));
+	fprintf(save, "MOV %s ", plcidstr(cmd->from, BAR_WORD));
+	fprintf(save, "%s\n", plcidstr(cmd->to, HOME_WORD));
 }
 
 void
-savedice(FILE *file, Dice dice[2])
+savewrite_end(FILE *save)
 {
-	int i, j;
-	fprintf(file, "ROLL ");
-	for (i = 0; i < DICE_COUNT; i++) {
-		for (j = 0; j < dice[i].use; j++)
-			fprintf(file, "%d ", dice[i].val);
-	}
-	fprintf(file, "\n");
+	fprintf(save, "END\n");
 }
 
 int
-errexit(Game *game, const char *msg)
+executecmd(Game *game, MoveCmd *cmd)
 {
-	curs_set(0);
-	wclear(game->prompt);
-	mvwprintw(game->prompt, 0, 0, "%s: %s", msg, strerror(errno));
-	wrefresh(game->prompt);
-	napms(ERR_DISP_TIME);
-	endwin();
-	exit(1);
+	size_t idx;
+
+	if (IS_ERR(idx = isvalidcmd(game, cmd))) return idx;
+	movechecker(game, cmd);
+	if (!game->steping) savewrite_mov(game->save, cmd);
+	return idx;
 }
 
 int
-opensave(Game *game)
+saveload(Game *game)
 {
 	char filename[128];
 	wclear(game->prompt);
@@ -727,12 +782,12 @@ opensave(Game *game)
 	curs_set(1);
 	wgetnstr(game->prompt, filename, 128);
 	curs_set(0);
-	if (!fopen(filename, "r")) {
-		errexit(game, "tmpfile");
+	if (!(game->save = fopen(filename, "rw"))) {
+		edie(game, "tmpfile");
 		game->state = END;
 		return errno;
 	}
-	game->state = END;
+	game->steping = 1;
 	return 0;
 }
 
@@ -748,10 +803,8 @@ gamemenu(Game *game)
 		wrefresh(game->prompt);
 		select = getch();
 	} while (select != 'P' && select != 'L');
-	switch (select) {
-		case 'L': opensave(game); break;
-		case 'P': game->state = START; break;
-	}
+	if (select == 'L') saveload(game);
+	game->state = START;
 	curs_set(1);
 }
 
@@ -768,13 +821,14 @@ gamestart(Game *game)
 			return;
 		}
 	}
-	do { roll(game->dice); } while (game->dice[0].val == game->dice[1].val);
+	do { roll(game); } while (game->dice[0].val == game->dice[1].val);
 	rolldrw(game, ME,  "[%d]", game->dice[ME].val);
 	rolldrw(game, YOU, "[%d]", game->dice[YOU].val);
 	game->turn = game->dice[ME].val > game->dice[YOU].val ? ME : YOU;
 	game->dice[0].val = 1;
 	game->dice[1].val = 2;
 	game->state = PLAY;
+	game->fstturn = 1;
 }
 
 void
@@ -833,30 +887,75 @@ gamewon(Game *game)
 }
 
 void
+skipblank(FILE *file) {
+	char ch;
+	while (isblank(ch = fgetc(file)) && ch != EOF);
+}
+
+int
+readfile(Game *game, char *start, char *end)
+{
+	char cmdname[CMD_SIZ];
+	int n;
+	n = fread(cmdname, 1, CMD_SIZ - 1, game->save); /* todo handle eof */
+	cmdname[n] = '\0';
+	if (!strcmp(cmdname, "END")) {
+		skipblank(game->save);
+		return END_TURN_ERR;
+	}
+	if (strcmp(cmdname, "MOV")) {
+		die(game, "expected MOV command, got: %s", cmdname);
+	}
+	fscanf(game->save, "%4s %4s", start, end);
+	wclear(game->prompt);
+	mvwprintw(game->prompt, 0, 0, "Turn of %s press any key to continue...", PLAYER_SYM(game->turn));
+	mvwprintw(game->prompt, 1, 0, "Next executing -- %s: %s %s", cmdname, start, end);
+	wgetch(game->prompt);
+	wrefresh(game->prompt);
+	skipblank(game->save);
+	return 0;
+}
+
+int
+cmdread(Game *game, MoveCmd *cmd)
+{
+	int err;
+	char start[INPUT_LEN], end[INPUT_LEN];
+	int (*reader)(Game *game, char *start, char *end);
+	reader = game->steping ?  readfile : readprompt;
+	if (reader(game, start, end) == END_TURN_ERR) {
+		if (!game->steping) savewrite_end(game->save);
+		return END_TURN_ERR;
+	}
+	if (!IS_ERR(err = cmdparse(cmd, game, start, end))) return err;
+	return 0;
+}
+
+void
 gameplay(Game *game)
 {
-	Cmd cmd;
-	char start[INPUT_LEN], end[INPUT_LEN];
+	MoveCmd cmd;
+	int err;
 	size_t i; /* this is either index or error i love c error handling btw */
 
 	if (!game->fstturn) {
-		roll(game->dice);
+		roll(game);
 		rolldrw(game, game->turn, "[%d] [%d]", game->dice[0].val, game->dice[1].val);
 	}
-	savedice(game->save, game->dice);
 
 	for (;;) {
-		cmd.type = MOVE_CMD;
-		if (readprompt(game, start, end)) break;
-		if (!IS_ERR(i = parsecmdfromprompt(&cmd.get.move, game, start, end)) &&
-				!IS_ERR(i = executecmd(game, &cmd))) {
-			savemvcmd(game->save, &cmd.get.move);
-			boarddrw(game);
-			game->dice[i].use--;
-			if (!game->dice[0].use && !game->dice[1].use) break;
+		if ((err = cmdread(game, &cmd)) == END_TURN_ERR) break;
+		if (IS_ERR(err)) {
+			errordrw(game, i);
 			continue;
 		}
-		errordrw(game, i);
+		if (IS_ERR(i = executecmd(game, &cmd))) {
+			errordrw(game, i);
+			continue;
+		}
+		boarddrw(game);
+		game->dice[i].use--;
+		if (!game->dice[0].use && !game->dice[1].use) break;
 	}
 
 	if (playerwon(game)) {
@@ -870,27 +969,6 @@ gameplay(Game *game)
 }
 
 void
-writesave(Game *game)
-{
-	char buff[64];
-	FILE *save;
-	size_t size;
-
-	mvwaddstr(game->prompt, 0, 0, "File path for save file: ");
-	wgetnstr(game->prompt, buff, 64);
-	mvwprintw(game->root, 0, 0, "%s", buff);
-	wrefresh(game->root);
-	if (!(save = fopen(buff, "w"))) {
-		errexit(game, "open");
-	}
-	size = ftell(game->save);
-	fseek(game->save, 0, SEEK_SET);
-	if (sendfile(fileno(save), fileno(game->save), NULL, size) < 0)
-	   errexit(game, "sendfile");
-	fclose(save);
-}
-
-void
 gameend(Game *game)
 {
 	char buff[64];
@@ -900,7 +978,10 @@ gameend(Game *game)
 		mvwaddstr(game->prompt, 0, 0, "Save game (ok/no)? ");
 		wgetnstr(game->prompt, buff, 2);
 		if (!strcmp(buff, "ok")) {
-			writesave(game);
+			while (savewrite(game)) {
+				enotify(game, "savewrite");
+				continue;
+			}
 			break;
 		} else if (!strcmp(buff, "no")) {
 			break;
