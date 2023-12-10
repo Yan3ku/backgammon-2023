@@ -143,6 +143,7 @@ typedef struct {
 	Dice dice[DICE_COUNT];
 	int fstturn;
 	FILE *save;
+	FILE *loaded;
 	int steping;
 	int skip;
 	WINDOW *root;
@@ -538,7 +539,7 @@ isvalidcmd(const Game *game, MoveCmd *move)
 
 	from = move->from.pos;
 	to   = move->to.pos;
-	
+
 	if (IS_ERR(err = validatekeyword(game, move))) return err;
 	if (!isvaliddir(game, from, to)) return MOVE_DIR_ERR;
 	if (havetobeat(game, to))        return HAVE_TO_BEAT_ERR;
@@ -610,17 +611,17 @@ readdice(Game *game)
 	int i;
 	char cmdname[CMD_SIZ];
 	i = 0;
-	fread(cmdname, CMD_SIZ - 1, 1, game->save);
+	fread(cmdname, CMD_SIZ - 1, 1, game->loaded);
 	cmdname[CMD_SIZ - 1] = '\0';
-	if (feof(game->save)) return CONTINUE_GAME_ERR;
+	if (feof(game->loaded)) return CONTINUE_GAME_ERR;
 	if (strcmp(cmdname, "ROL")) {
 		die(game, "expected ROL command");
 	}
 	game->dice[0].use = game->dice[1].use = 1;
-	while ((ch = fgetc(game->save)) != '\n' && ch != EOF) {
+	while ((ch = fgetc(game->loaded)) != '\n' && ch != EOF) {
 		if (isdigit(ch)) {
-			ungetc(ch, game->save);
-			fscanf(game->save, "%d", &game->dice[i++].val);
+			ungetc(ch, game->loaded);
+			fscanf(game->loaded, "%d", &game->dice[i++].val);
 		}
 		if (i == 2 && game->dice[0].val == game->dice[1].val) {
 			i = 1;
@@ -628,6 +629,7 @@ readdice(Game *game)
 		}
 		if (i > 3) die(game, "to many argument to ROL");
 	}
+	return 0;
 }
 
 int
@@ -754,7 +756,7 @@ executecmd(Game *game, MoveCmd *cmd)
 
 	if (IS_ERR(idx = isvalidcmd(game, cmd))) return idx;
 	movechecker(game, cmd);
-	if (!game->steping) savewrite_mov(game->save, cmd);
+	savewrite_mov(game->save, cmd);
 	return idx;
 }
 
@@ -767,18 +769,19 @@ roll(Game *game)
 {
 	int i;
 	if (game->steping && readdice(game) != CONTINUE_GAME_ERR) {
+		savewrite_roll(game->save, game->dice);
 		return;
 	}
 
 	for (i = 0; i < 2; i++) game->dice[i].val = rand() % 6 + 1;
 	game->dice[0].use = game->dice[1].use = (game->dice[0].val == game->dice[1].val ? 2 : 1);
-	if (!game->steping) savewrite_roll(game->save, game->dice);
+	savewrite_roll(game->save, game->dice);
 }
 
-#define rolldrw(game, player, str, ...) do {                                   \
-	mvwprintw(game->roll[player], 0, 0, ROLL_PROMPT(player));                  \
-	wprintw(  game->roll[player], str, __VA_ARGS__);                           \
-	wnoutrefresh( game->roll[player]);                                         \
+#define rolldrw(game, player, str, ...) do {                                    \
+	mvwprintw(game->roll[player], 0, 0, ROLL_PROMPT(player));               \
+	wprintw(  game->roll[player], str, __VA_ARGS__);                        \
+	wnoutrefresh( game->roll[player]);                                      \
 } while (0)
 
 int
@@ -791,7 +794,7 @@ saveload(Game *game)
 	curs_set(1);
 	wgetnstr(game->prompt, filename, 128);
 	curs_set(0);
-	if (!(game->save = fopen(filename, "rw"))) {
+	if (!(game->loaded = fopen(filename, "rw"))) {
 		edie(game, "tmpfile");
 		game->state = END;
 		return errno;
@@ -920,26 +923,25 @@ int
 readfile(Game *game, char *start, char *end)
 {
 	char cmdname[CMD_SIZ];
-	char ch;
 	int n;
-	n = fread(cmdname, 1, CMD_SIZ - 1, game->save); /* todo handle eof */
-	if (feof(game->save)) {
+	n = fread(cmdname, 1, CMD_SIZ - 1, game->loaded); /* todo handle eof */
+	if (feof(game->loaded)) {
 		game->steping = 0;
 		return CONTINUE_GAME_ERR;
-	} 
+	}
 	cmdname[n] = '\0';
 	if (!strcmp(cmdname, "END")) {
-		skipblank(game->save);
+		skipblank(game->loaded);
 		return END_TURN_ERR;
 	}
 	if (strcmp(cmdname, "MOV")) {
 		die(game, "expected MOV command, got: %s", cmdname);
 	}
-	fscanf(game->save, "%4s %4s", start, end);
+	fscanf(game->loaded, "%4s %4s", start, end);
 	wclear(game->prompt);
 	if (!game->skip)
 		if (promptstep(game, cmdname, start, end)) return CONTINUE_GAME_ERR;
-	skipblank(game->save);
+	skipblank(game->loaded);
 	return 0;
 }
 
@@ -951,7 +953,7 @@ cmdread(Game *game, MoveCmd *cmd)
 	int (*reader)(Game *game, char *start, char *end);
 	reader = game->steping ?  readfile : readprompt;
 	if (IS_ERR(err = reader(game, start, end))) {
-		if (err == END_TURN_ERR && !game->steping) savewrite_end(game->save);
+		if (err == END_TURN_ERR) savewrite_end(game->save);
 		return err;
 	}
 	if (!IS_ERR(err = cmdparse(cmd, game, start, end))) return err;

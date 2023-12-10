@@ -1,6 +1,7 @@
+DEBUG    = -fsanitize-undefined-trap-on-error -fsanitize=address,undefined -g3 # -fsanitize-trap=all
 CPPFLAGS = $(shell ncursesw6-config --cflags)
-CFLAGS   = -ggdb -std=c89 -Wextra -Wall ${CPPFLAGS} 
-LDFLAGS  = $(shell ncursesw6-config --libs)
+CFLAGS   = -std=c99 -pedantic -Wextra -Wall ${CPPFLAGS} ${DEBUG}
+LDFLAGS  = $(shell ncursesw6-config --libs) ${DEBUG}
 
 BIN = prog
 SRC = prog.c
