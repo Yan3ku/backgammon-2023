@@ -13,7 +13,9 @@
 #include <ncursesw/curses.h>
 
 #define PLAYER_COUNT     2
+#define BEST_SCORES_NO   5
 #define DICE_COUNT       2
+#define NAME_MAX_LEN     24
 #define TITLE            "The Game of GAMMON by yan3ku v0.1"
 #define ROLL_PROMPT(p)   "%s roll> ", (p == ME ? "My" : "Your")
 #define OTHER_PLAYER(p)  ((p) != EMPTY ? (p + 1) % 2 : EMPTY)
@@ -21,6 +23,7 @@
 #define TERM_SIZE_ERR    "Terminal window too small!"
 #define PLAYER_SYM(pl)   ((pl) == ME ? "░░" : "▓▓")
 #define PLAYER_DIR(pl)   ((pl) == ME ? "low to high" : "high to low")
+#define SCORES_FILE      "scores"
 #define UNUSED(p)        (void)(p)
 #define INPUT_LEN        5
 #define CMD_SIZ          4
@@ -35,6 +38,7 @@
 #define MOVE_DIR(pl)     (pl ? -1 : +1);
 #define START_PLC(pl)    ((pl) == ME ? BOARD_BEG - 1 : BOARD_END + 1)
 #define BEAROFF_PLC(pl)  ((pl) == ME ? BOARD_END + 1 : BOARD_BEG - 1)
+#define MAX(v1, v2)      ((v1) > (v2) ? v1 : v2)
 #define HOME(game, pl)   ((game).places[BEAROFF_PLC(pl)].count)
 
 
@@ -46,7 +50,6 @@ typedef enum {
 
 typedef enum {
 	MENU,
-	STEP,
 	START,
 	PLAY,
 	WON,
@@ -105,6 +108,11 @@ enum { /* sizes used for drawing windows */
 };
 
 typedef struct {
+	char name[24];
+	int points;
+} Score;
+
+typedef struct {
 	int val;
 	int use;
 } Dice;
@@ -151,6 +159,11 @@ typedef struct {
 	WINDOW *roll[PLAYER_COUNT];
 	WINDOW *prompt;
 	WINDOW *whome;
+	int clearscores;
+	/* +1 cause insert new score and sort the array */
+	/* look 'loadscores' */
+	Score scores[BEST_SCORES_NO + 1];
+	int scores_no;
 } Game;
 
 /***************************************************
@@ -221,6 +234,22 @@ setup()
 }
 
 void
+scoresload(Game *game)
+{
+	FILE *score;
+	char line[124];
+	int i;
+	if (!(score = fopen(SCORES_FILE, "r"))) {
+		edie(game, "scores file");
+	}
+
+	for (i = 0; fgets(line, 124, score) && i < BEST_SCORES_NO; i++) {
+		sscanf(line, "%s %d", game->scores[i].name, &game->scores[i].points);
+	}
+	game->scores_no = i;
+}
+
+void
 initboard(Game *game)
 {
 	size_t i;
@@ -241,6 +270,16 @@ initboard(Game *game)
 		game->places[PLACES_SIZ - i - 1].pl = OTHER_PLAYER(game->places[i].pl);
 		game->places[PLACES_SIZ - i - 1].count = game->places[i].count;
 	}
+
+	if (!(game->save = tmpfile())) {
+		wclear(game->prompt);
+		mvwaddstr(game->prompt, 0, 0, strerror(errno));
+		wrefresh(game->prompt);
+		game->state = EXIT;
+		return;
+	}
+
+	scoresload(game);
 	wnoutrefresh(game->board);
 	wnoutrefresh(game->whome);
 	doupdate();
@@ -265,6 +304,7 @@ gamecreate()
 	*/
 
 	game->state = MENU;
+	game->clearscores = 1;
 	return game;
 }
 
@@ -294,11 +334,26 @@ plctosym(const Place *plc, int i, int j)
 }
 
 void
-scoredrw(Game *game)
+gamescoredrw(Game *game)
 {
 	char buff[64];
 	sprintf(buff, "SCORE: Me %d, You %d", game->score[ME], game->score[YOU]);
 	mvwaddstr(game->root, 0, ROOT_COLS - strlen(buff), buff);
+}
+
+void
+bestscoresdrw(Game *game)
+{
+	int i, begx, begy;
+	begy = (BOARD_LINES - game->scores_no) / 2;
+	wclear(game->board);
+	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
+	for (i = 0; i < game->scores_no; i++) {
+		begx = (BOARD_COLS - strlen(game->scores[i].name)) / 2;
+		mvwprintw(game->board, begy + i, begx, "%s, %d",
+			 game->scores[i].name, game->scores[i].points);
+	}
+	wnoutrefresh(game->board);
 }
 
 void /* this function name means board draw (drw) btw */
@@ -334,7 +389,7 @@ boarddrw(Game *game)
 			mvwaddstr(game->board, y, x, plctosym(game->places, i, j));
 		}
 	}
-	scoredrw(game);
+	gamescoredrw(game);
 
 	wnoutrefresh(game->whome);
 	wnoutrefresh(game->board);
@@ -375,6 +430,7 @@ gameinitdrw(Game *game)
 	mvwvline(game->whome, 0, HOME_COLS - 1, ':', BOARD_LINES);
 
 	boarddrw(game);
+	bestscoresdrw(game);
 
 	for (i = BOARD_BEG, j = 0; i <= BOARD_END; i++) {
 		plctoscr(i, j, &y, &x);
@@ -499,7 +555,7 @@ isvaliddir(const Game *game, int from , int to)
 {
 
 	return !((game->turn == ME  && from > to) ||
-			 (game->turn == YOU && from < to));
+		 (game->turn == YOU && from < to));
 }
 
 int
@@ -552,7 +608,7 @@ isvalidcmd(const Game *game, MoveCmd *move)
 	 * if the roll is greater than the distance from last checker to home you can bearoff it
 	 */
 	if (islastchecker(game, from) && !IS_ERR(idx = findmove(game->dice, abs(from - to), geq)))
-			return idx;
+		return idx;
 	return NO_MOVE_ROLLED_ERR;
 }
 
@@ -565,7 +621,7 @@ isvalidcmd(const Game *game, MoveCmd *move)
  * MOV BAR 23    - moves from place to place (basically like the prompt)
  * END           - explicitly end turn
  * TODO: Probably good idea to add anotations to ROL which player turn is it
-*/
+ */
 const char *
 plcidstr(PlcId plc, MoveKey keyword)
 {
@@ -642,8 +698,6 @@ savewrite(Game *game)
 	wclear(game->prompt);
 	mvwaddstr(game->prompt, 0, 0, "File path for save file: ");
 	wgetnstr(game->prompt, buff, 64);
-	mvwprintw(game->root, 0, 0, "%s", buff);
-	wrefresh(game->root);
 	if (!(save = fopen(buff, "w")))
 		return errno;
 	size = ftell(game->save);
@@ -675,13 +729,17 @@ readprompt(Game *game, char *start, char *end)
 			mvwprintw(game->prompt, 1, 0, "End turn (ok/no)? ");
 			wread(game->prompt, start, 3);
 			if (!strcmp(start, "ok")) return END_TURN_ERR;
-		} if (!strcmp(start, "SAVE")){
+			continue;
+		} else if (!strcmp(start, "SAVE")) {
 			if (savewrite(game)) {
 				enotify(game, "can't save game");
 				continue;
 			}
 			notify(game, "Game saved!");
 			continue;
+		} else if (!strcmp(start, "EXIT")) {
+			game->state = END;
+			return END_TURN_ERR;
 		} else break;
 	};
 
@@ -778,11 +836,11 @@ roll(Game *game)
 	savewrite_roll(game->save, game->dice);
 }
 
-#define rolldrw(game, player, str, ...) do {                                    \
-	mvwprintw(game->roll[player], 0, 0, ROLL_PROMPT(player));               \
-	wprintw(  game->roll[player], str, __VA_ARGS__);                        \
-	wnoutrefresh( game->roll[player]);                                      \
-} while (0)
+#define rolldrw(game, player, str, ...) do {				\
+		mvwprintw(game->roll[player], 0, 0, ROLL_PROMPT(player)); \
+		wprintw(  game->roll[player], str, __VA_ARGS__);	\
+		wnoutrefresh( game->roll[player]);			\
+	} while (0)
 
 int
 saveload(Game *game)
@@ -823,16 +881,13 @@ gamemenu(Game *game)
 void
 gamestart(Game *game)
 {
-	if (!game->save) {
-		game->save = tmpfile();
-		if (!game->save) {
-			wclear(game->prompt);
-			mvwaddstr(game->prompt, 0, 0, strerror(errno));
-			wrefresh(game->prompt);
-			game->state = EXIT;
-			return;
-		}
+	if (game->clearscores) {
+		game->clearscores = 0;
+		wclear(game->board);
+		wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
+		boarddrw(game);
 	}
+
 	do { roll(game); } while (game->dice[0].val == game->dice[1].val);
 	rolldrw(game, ME,  "[%d]", game->dice[ME].val);
 	rolldrw(game, YOU, "[%d]", game->dice[YOU].val);
@@ -870,7 +925,7 @@ updatescore(Game *game)
 	} else if (HOME(*game, OTHER_PLAYER(game->turn))) {
 		*score += 2;
 	} else *score += 1;
-	scoredrw(game);
+	gamescoredrw(game);
 	wnoutrefresh(game->root);
 }
 
@@ -912,8 +967,8 @@ promptstep(Game *game, char *cmdname, char *start, char *end)
 	mvwprintw(game->prompt, 0, 0, "Turn of %s (C)ONTINUE / (P)AY / (S)SKIP...", PLAYER_SYM(game->turn));
 	mvwprintw(game->prompt, 1, 0, "Next executing -- %s: %s %s", cmdname, start, end);
 	switch ((ch = wgetch(game->prompt))) {
-		case 'P': game->steping = 0; return CONTINUE_GAME_ERR;
-		case 'S': game->skip = 1; break;
+	case 'P': game->steping = 0; return CONTINUE_GAME_ERR;
+	case 'S': game->skip = 1; break;
 	}
 	wrefresh(game->prompt);
 	return 0;
@@ -998,8 +1053,55 @@ gameplay(Game *game)
 	game->fstturn = 0;
 }
 
+int
+scorecmp(const void *s1, const void *s2)
+{
+	return ((Score *)s2)->points - ((Score *)s1)->points;
+}
+
 void
-gameend(Game *game)
+savescores(Game *game)
+{
+	FILE *scores;
+	int i;
+
+	if (!(scores = fopen(SCORES_FILE, "w"))) {
+		enotify(game, "can't open score file");
+		return;
+	}
+
+	game->scores[game->scores_no].points = MAX(game->score[ME], game->score[YOU]);
+	wclear(game->prompt);
+	mvwaddstr(game->prompt, 0, 0, "Player name: ");
+	wgetnstr(game->prompt, game->scores[game->scores_no].name, 24);
+	qsort(game->scores, game->scores_no + 1, sizeof(Score), scorecmp);
+	for (i = 0; i < (game->scores_no + 1) % 10; i++) {
+		fprintf(scores, "%s %d\n", game->scores[i].name, game->scores[i].points);
+	}
+}
+
+
+void
+gamesavescores(Game *game)
+{
+	char buff[64];
+
+	for (;;) {
+		wclear(game->prompt);
+		mvwaddstr(game->prompt, 0, 0, "Save scores (ok/no)? ");
+		wgetnstr(game->prompt, buff, 2);
+		if (!strcmp(buff, "ok")) {
+			savescores(game);
+			break;
+		} else if (!strcmp(buff, "no")) {
+			break;
+		}
+	}
+}
+
+
+void
+gamesavestate(Game *game)
 {
 	char buff[64];
 
@@ -1017,6 +1119,13 @@ gameend(Game *game)
 			break;
 		}
 	}
+}
+
+void
+gameend(Game *game)
+{
+	gamesavestate(game);
+	gamesavescores(game);
 	game->state = EXIT;
 }
 
@@ -1034,13 +1143,10 @@ main()
 		case PLAY:  gameplay(game); break;
 		case WON:   gamewon(game); break;
 		case END:   gameend(game); break;
-		case EXIT:  break;
-		case STEP:  break;
+		case EXIT: break;		   /* silence */
 		}
 	}
 	endwin();
 	free(game);
 	return 0;
 }
-
-/* vim: set ts=4 sts=4 sw=4 noet: */
