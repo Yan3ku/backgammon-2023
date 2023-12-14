@@ -250,6 +250,18 @@ scoresload(Game *game)
 }
 
 void
+gameinitsave(Game *game)
+{
+	if (!(game->save = tmpfile())) {
+		wclear(game->prompt);
+		mvwaddstr(game->prompt, 0, 0, strerror(errno));
+		wrefresh(game->prompt);
+		game->state = EXIT;
+		return;
+	}
+}
+
+void
 initboard(Game *game)
 {
 	size_t i;
@@ -271,14 +283,7 @@ initboard(Game *game)
 		game->places[PLACES_SIZ - i - 1].count = game->places[i].count;
 	}
 
-	if (!(game->save = tmpfile())) {
-		wclear(game->prompt);
-		mvwaddstr(game->prompt, 0, 0, strerror(errno));
-		wrefresh(game->prompt);
-		game->state = EXIT;
-		return;
-	}
-
+	gameinitsave(game);
 	scoresload(game);
 	wnoutrefresh(game->board);
 	wnoutrefresh(game->whome);
@@ -294,7 +299,6 @@ gamecreate()
 	game->fstturn = 1;
 	initboard(game);
 	/*
-	   HOME(*game, ME) = 14;
 	   game->places[23]  = (Place){.pl = ME,  .count = 1};
 	   game->places[21]  = (Place){.pl = YOU,  .count = 1};
 	   game->places[20]  = (Place){.pl = ME,  .count = 3};
@@ -356,12 +360,12 @@ bestscoresdrw(Game *game)
 	wnoutrefresh(game->board);
 }
 
-void /* this function name means board draw (drw) btw */
-boarddrw(Game *game)
+
+void
+boarddrwlines(Game *game)
 {
 	size_t i, j;
-	int x, y;
-
+	int y;
 	for (i = 0; i < 3; i++) /* bar lines */
 		mvwvline(game->board, 1, BOARD_COLS / 2 - i + 1, '|', BOARD_LINES - 2);
 	mvwprintw(game->board, BOARD_LINES / 2, BOARD_COLS / 2 - 2, "[BAR]");
@@ -373,7 +377,13 @@ boarddrw(Game *game)
 			          PLAYER_SYM(i));
 		}
 	}
+}
 
+void
+boarddrwhome(Game *game)
+{
+	size_t i, j;
+	int y;
 	for (i = 0; i < 2; i++) { /* home */
 		for (j = 0; j < CHECKER_COUNT; j++) {
 			y = (i == YOU ? BOARD_LINES - 2 - j % 5 : j % 5 + 1);
@@ -382,18 +392,92 @@ boarddrw(Game *game)
 	}
 
 	mvwprintw(game->whome, BOARD_LINES / 2, 0, "[HOME]");
+}
 
+void
+boarddrwplc(Game *game)
+{
+	size_t i, j;
+	int x, y;
 	for (i = BOARD_BEG; i <= BOARD_END; i++)  { /* places */
 		for (j = 0; j < 6; j++) {
 			plctoscr(i, j, &y, &x);
 			mvwaddstr(game->board, y, x, plctosym(game->places, i, j));
 		}
 	}
-	gamescoredrw(game);
+}
 
+void /* this function name means board draw (drw) btw */
+boarddrw(Game *game)
+{
+
+
+	boarddrwlines(game);
+	boarddrwhome(game);
+	boarddrwplc(game);
+	gamescoredrw(game);
 	wnoutrefresh(game->whome);
 	wnoutrefresh(game->board);
 }
+
+void
+asdfasdjkf(Game *game)
+{
+	game->whome = derwin(game->root, BOARD_LINES, HOME_COLS, getpary(game->board), BOARD_COLS);
+	mvwhline(game->whome, 0, 0, '=', HOME_COLS);
+	mvwhline(game->whome, BOARD_LINES - 1, 0, '=', HOME_COLS);
+	mvwvline(game->whome, 0, HOME_COLS - 1, ':', BOARD_LINES);
+}
+
+void
+alsdkjfalksjdf(Game *game)
+{
+	game->root  = newwin(ROOT_LINES, ROOT_COLS,
+	                     (LINES - ROOT_LINES) / 2,
+	                     (COLS  - ROOT_COLS)  / 2);
+	mvwaddstr(game->root, 0, 0, TITLE);
+
+}
+
+int
+askdljfasldjf(Game *game)
+{
+	game->board = derwin(game->root, BOARD_LINES, BOARD_COLS, 3, 0);
+	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
+	return getpary(game->board) + getmaxy(game->board);
+}
+
+int
+gamemakewindows(Game *game)
+{
+	int boardendy;
+	int x, y;
+
+	alsdkjfalksjdf(game);
+	boardendy = askdljfasldjf(game);
+	plctoscr(14, 0, &y, &x); /* 14 places is at the left center */
+	game->roll[0] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
+	plctoscr(20, 0, &y, &x); /* 20 places is at the right center */
+	game->roll[1] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
+
+	game->prompt  = derwin(game->root, PROMPT_LINES, BOARD_COLS, boardendy + 2, 0);
+
+	asdfasdjkf(game);
+	return boardendy;
+}
+
+
+void
+gamerefresh(Game *game)
+{
+	wnoutrefresh(stdscr);
+	wnoutrefresh(game->root);
+	wnoutrefresh(game->whome);
+	wnoutrefresh(game->prompt);
+	wnoutrefresh(game->board);
+	doupdate();
+}
+
 
 void
 gameinitdrw(Game *game)
@@ -408,27 +492,8 @@ gameinitdrw(Game *game)
 		return;
 	}
 
-	game->root  = newwin(ROOT_LINES, ROOT_COLS,
-	                     (LINES - ROOT_LINES) / 2,
-	                     (COLS  - ROOT_COLS)  / 2);
-	mvwaddstr(game->root, 0, 0, TITLE);
 
-	game->board = derwin(game->root, BOARD_LINES, BOARD_COLS, 3, 0);
-	wborder(game->board, ':', ':', '=', '=', ':', ':', ':', ':');
-	boardendy   = getpary(game->board) + getmaxy(game->board);
-
-	plctoscr(14, 0, &y, &x); /* 14 places is at the left center */
-	game->roll[0] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
-	plctoscr(20, 0, &y, &x); /* 20 places is at the right center */
-	game->roll[1] = derwin(game->board, 1, 18, BOARD_LINES / 2, x);
-
-	game->prompt  = derwin(game->root, PROMPT_LINES, BOARD_COLS, boardendy + 2, 0);
-
-	game->whome = derwin(game->root, BOARD_LINES, HOME_COLS, getpary(game->board), BOARD_COLS);
-	mvwhline(game->whome, 0, 0, '=', HOME_COLS);
-	mvwhline(game->whome, BOARD_LINES - 1, 0, '=', HOME_COLS);
-	mvwvline(game->whome, 0, HOME_COLS - 1, ':', BOARD_LINES);
-
+	boardendy = gamemakewindows(game);
 	boarddrw(game);
 	bestscoresdrw(game);
 
@@ -436,13 +501,8 @@ gameinitdrw(Game *game)
 		plctoscr(i, j, &y, &x);
 		mvwprintw(game->root, i < 13 ? boardendy : getpary(game->board) - 1, x, "%2ld", i);
 	}
+	gamerefresh(game);
 
-	wnoutrefresh(stdscr);
-	wnoutrefresh(game->root);
-	wnoutrefresh(game->whome);
-	wnoutrefresh(game->prompt);
-	wnoutrefresh(game->board);
-	doupdate();
 }
 
 /****************************************************
@@ -458,7 +518,7 @@ canbearoff(const Game *game)
 		}
 	}
 	count += HOME(*game, game->turn);
-	return count > 15;
+	return count >= 15;
 }
 
 
@@ -708,22 +768,31 @@ savewrite(Game *game)
 	return 0;
 }
 
+
+
+void
+printprompt(Game *game)
+{
+	int i, j;
+	wclear(game->prompt);
+	mvwprintw(game->prompt, 0, 0, "You %s have ", PLAYER_SYM(game->turn));
+	for (i = 0; i < 2; i++)
+		for (j = 0; j < game->dice[i].use; j++)
+			wprintw(game->prompt, "[%d] ", game->dice[i].val);
+	wprintw(game->prompt, "left, moving from %s", PLAYER_DIR(game->turn));
+	mvwprintw(game->prompt, 1, 0, "Move from? ");
+	wnoutrefresh(game->prompt);
+}
+
+
 int
 readprompt(Game *game, char *start, char *end)
 {
-	int i, j;
 	*start = '\0';
 	*end = '\0';
 
 	for (;;) {
-		wclear(game->prompt);
-		mvwprintw(game->prompt, 0, 0, "You %s have ", PLAYER_SYM(game->turn));
-		for (i = 0; i < 2; i++)
-			for (j = 0; j < game->dice[i].use; j++)
-				wprintw(game->prompt, "[%d] ", game->dice[i].val);
-		wprintw(game->prompt, "left, moving from %s", PLAYER_DIR(game->turn));
-		mvwprintw(game->prompt, 1, 0, "Move from? ");
-		wnoutrefresh(game->prompt);
+		printprompt(game);
 		wread(game->prompt, start, INPUT_LEN);
 		if (!strcmp(start, "END")) {
 			mvwprintw(game->prompt, 1, 0, "End turn (ok/no)? ");
@@ -892,8 +961,6 @@ gamestart(Game *game)
 	rolldrw(game, ME,  "[%d]", game->dice[ME].val);
 	rolldrw(game, YOU, "[%d]", game->dice[YOU].val);
 	game->turn = game->dice[ME].val > game->dice[YOU].val ? ME : YOU;
-	game->dice[0].val = 1;
-	game->dice[1].val = 2;
 	game->state = PLAY;
 	game->fstturn = 1;
 }
@@ -1016,17 +1083,22 @@ cmdread(Game *game, MoveCmd *cmd)
 }
 
 void
-gameplay(Game *game)
+gameroll(Game *game)
 {
-	MoveCmd cmd;
-	int err;
-	size_t i; /* this is either index or error i love c error handling btw */
-
 	if (!game->fstturn) {
 		roll(game);
 		rolldrw(game, game->turn, "[%d] [%d]", game->dice[0].val, game->dice[1].val);
 	}
+}
 
+void
+gameplay(Game *game)
+{
+	MoveCmd cmd;
+	int err;
+	size_t i;
+
+	gameroll(game);
 	for (;;) {
 		if ((err = cmdread(game, &cmd)) == END_TURN_ERR) break;
 		if (err == CONTINUE_GAME_ERR) continue;
